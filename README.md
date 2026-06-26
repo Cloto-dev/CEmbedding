@@ -1,0 +1,102 @@
+<div align="center">
+
+# CEmbedding
+
+### Local-first embedding server
+
+Vector embeddings over a tiny HTTP contract.
+On-device ONNX or any OpenAI-compatible API. The reference `/embed` server for [CPersona](https://github.com/Cloto-dev/CPersona).
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-blue.svg)]()
+
+</div>
+
+---
+
+> **Standalone repository** — extracted from the (now private) `clotohub-servers` monorepo so it can be used on its own. [ClotoCore](https://github.com/Cloto-dev/ClotoCore) users get this through the in-app marketplace ([ClotoHub](https://hub.cloto.dev)); everyone else can run it directly as described below.
+
+## What it is
+
+A small server that turns text into vectors. It speaks a minimal HTTP contract so anything can call it — its primary consumer is [CPersona](https://github.com/Cloto-dev/CPersona), whose hybrid search uses it for the vector-similarity layer. It can run a model **on-device** via ONNX (no API key, no network) or proxy an **OpenAI-compatible API**.
+
+It also exposes an MCP (stdio) surface and an optional persistent vector index (`/index`, `/search`), but the HTTP `/embed` endpoint is all CPersona needs.
+
+## The `/embed` contract
+
+```
+POST /embed
+Request:  { "texts": ["string", ...] }                 # non-empty array, max 100 per batch
+Response: { "embeddings": [[float, ...], ...], "dimensions": <int> }
+```
+
+Point any client (e.g. CPersona's `CPERSONA_EMBEDDING_URL` / generic `EMBEDDING_HTTP_URL`) at `http://127.0.0.1:8401/embed`.
+
+## Quick Start (on-device ONNX)
+
+**Prerequisites:** Python 3.10+
+
+```bash
+git clone https://github.com/Cloto-dev/CEmbedding.git
+cd CEmbedding
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install ".[onnx]"
+
+# Download a model into ./data/models (jina-v5-nano is what CPersona is tuned for)
+python download_model.py --model jina-v5-nano
+
+# Run the server
+EMBEDDING_PROVIDER=onnx_jina_v5_nano python server.py
+```
+
+You should see `HTTP embedding endpoint started on http://127.0.0.1:8401/embed`. Verify it:
+
+```bash
+curl -s http://127.0.0.1:8401/embed \
+  -H 'content-type: application/json' \
+  -d '{"texts":["hello world"]}' | head -c 200
+```
+
+## Providers
+
+Set `EMBEDDING_PROVIDER`:
+
+| Value | Model | Notes |
+|-------|-------|-------|
+| `onnx_jina_v5_nano` | jina-v5-nano (33M, 768d) | Local CPU, what CPersona is benchmarked against |
+| `onnx_bge_m3` | bge-m3 | Local CPU, larger / multilingual |
+| `onnx_miniml` | all-MiniLM-L6-v2 (22M, 384d) | Local CPU, smallest |
+| `mlx_bge_m3` | bge-m3 (MLX) | Apple Silicon only — `pip install ".[mlx]"` |
+| `api_openai` | provider's model | OpenAI-compatible API; needs `EMBEDDING_API_KEY` (+ optional `EMBEDDING_API_URL`, `EMBEDDING_MODEL`) |
+
+Download a local model with `python download_model.py --model {miniml,jina-v5-nano,bge-m3}` (fetched from HuggingFace into `./data/models`; not committed to this repo).
+
+## Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `EMBEDDING_PROVIDER` | `api_openai` | Provider (see table above) |
+| `EMBEDDING_HTTP_PORT` | `8401` | HTTP port for `/embed` |
+| `EMBEDDING_INDEX_ENABLED` | `true` | Enable the persistent vector index endpoints (`/index`, `/search`, `/remove`, `/purge`) |
+| `ONNX_MODEL_DIR` | (auto) | Override the model directory for ONNX providers |
+| `ONNX_EP_PREFERENCE` | (auto) | ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured) |
+| `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
+| `EMBEDDING_API_KEY` | — | Required for `api_openai` |
+| `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
+
+## Use with CPersona
+
+Run this server, then tell CPersona to use it:
+
+```bash
+# CPersona MCP config env
+CPERSONA_EMBEDDING_MODE=http
+CPERSONA_EMBEDDING_URL=http://127.0.0.1:8401/embed
+```
+
+Without an embedding server CPersona still works (FTS5 + keyword search); adding one enables the vector-similarity layer.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

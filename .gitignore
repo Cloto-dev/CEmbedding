@@ -1,0 +1,13 @@
+# Downloaded ONNX/MLX models + runtime index (fetched via download_model.py)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.uv/
+uv.lock

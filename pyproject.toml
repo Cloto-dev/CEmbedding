@@ -1,0 +1,31 @@
+[project]
+name = "cembedding"
+version = "0.4.0"
+description = "Local-first embedding server: vector generation + index/search over HTTP (ONNX on-device or API providers). The reference /embed server for CPersona."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ClotoCore Project", email = "ClotoCore@proton.me" }]
+keywords = ["embedding", "mcp", "onnx", "vector-search", "jina", "bge-m3"]
+dependencies = [
+    "mcp>=1.0.0,<1.27.0",
+    "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
+    "numpy>=1.24.0",
+    "aiosqlite>=0.20.0",
+]
+
+[project.optional-dependencies]
+onnx     = ["onnxruntime>=1.17.0", "tokenizers>=0.15.0"]
+onnx-gpu = ["onnxruntime-gpu>=1.17.0", "tokenizers>=0.15.0"]
+mlx      = ["mlx>=0.18.0", "mlx-embeddings>=0.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/Cloto-dev/CEmbedding"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
