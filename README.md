@@ -37,17 +37,26 @@ Point any client (e.g. CPersona's `CPERSONA_EMBEDDING_URL` / generic `EMBEDDING_
 **Prerequisites:** Python 3.10+
 
 ```bash
+# Download a model into ./data/models (jina-v5-nano is what CPersona is tuned for)
+uvx --from "cembedding[onnx]" cembedding-download-model --model jina-v5-nano
+
+# Run the server (reads ./data/models from the current directory)
+EMBEDDING_PROVIDER=onnx_jina_v5_nano uvx --from "cembedding[onnx]" cembedding
+```
+
+Or install it onto your PATH with `pip install "cembedding[onnx]"`, then run
+`cembedding-download-model --model jina-v5-nano` and `cembedding`.
+
+From source (development):
+
+```bash
 git clone https://github.com/Cloto-dev/CEmbedding.git
 cd CEmbedding
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install ".[onnx]"
-
-# Download a model into ./data/models (jina-v5-nano is what CPersona is tuned for)
-python download_model.py --model jina-v5-nano
-
-# Run the server
-EMBEDDING_PROVIDER=onnx_jina_v5_nano python server.py
+python -m cembedding.download_model --model jina-v5-nano
+EMBEDDING_PROVIDER=onnx_jina_v5_nano python -m cembedding   # or: python server.py
 ```
 
 You should see `HTTP embedding endpoint started on http://127.0.0.1:8401/embed`. Verify it:
@@ -70,7 +79,7 @@ Set `EMBEDDING_PROVIDER`:
 | `mlx_bge_m3` | bge-m3 (MLX) | Apple Silicon only — `pip install ".[mlx]"` |
 | `api_openai` | provider's model | OpenAI-compatible API; needs `EMBEDDING_API_KEY` (+ optional `EMBEDDING_API_URL`, `EMBEDDING_MODEL`) |
 
-Download a local model with `python download_model.py --model {miniml,jina-v5-nano,bge-m3}` (fetched from HuggingFace into `./data/models`; not committed to this repo).
+Download a local model with `cembedding-download-model --model {miniml,jina-v5-nano,bge-m3}` (or `python -m cembedding.download_model ...` from a source checkout; fetched from HuggingFace into `./data/models`, not committed to this repo).
 
 ## Configuration
 

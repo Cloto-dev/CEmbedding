@@ -113,7 +113,8 @@ def download_bge_m3(model_dir: str = "") -> bool:
     return ok
 
 
-if __name__ == "__main__":
+def main():
+    """Console-script / ``python -m cembedding.download_model`` entry point."""
     parser = argparse.ArgumentParser(description="Download ONNX embedding models")
     parser.add_argument("--model", default="miniml", choices=["miniml", "jina-v5-nano", "bge-m3"])
     args = parser.parse_args()
@@ -125,3 +126,7 @@ if __name__ == "__main__":
     else:
         success = download_bge_m3()
     sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -11,7 +11,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool, ToolAnnotations
 
-from _vendored_mcp_common.validation import validate_bool, validate_dict, validate_float, validate_int, validate_list, validate_str
+from cembedding._vendored_mcp_common.validation import validate_bool, validate_dict, validate_float, validate_int, validate_list, validate_str
 
 
 class _MgpValidationFilter(logging.Filter):
