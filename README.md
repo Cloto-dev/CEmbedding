@@ -88,6 +88,8 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `EMBEDDING_PROVIDER` | `api_openai` | Provider (see table above) |
 | `EMBEDDING_HTTP_PORT` | `8401` | HTTP port for `/embed` |
 | `EMBEDDING_INDEX_ENABLED` | `true` | Enable the persistent vector index endpoints (`/index`, `/search`, `/remove`, `/purge`) |
+| `EMBEDDING_INDEX_DB_PATH` | `data/embedding_index.db` | SQLite file backing the vector index |
+| `EMBEDDING_SEARCH_BACKEND` | `numpy` | `/search` matmul backend. `numpy` (Accelerate BLAS) or `mlx` (Apple-GPU resident matrix; falls back to numpy when mlx is absent) |
 | `ONNX_MODEL_DIR` | (auto) | Override the model directory for ONNX providers |
 | `ONNX_EP_PREFERENCE` | (auto) | ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured) |
 | `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
@@ -105,6 +107,24 @@ CPERSONA_EMBEDDING_URL=http://127.0.0.1:8401/embed
 ```
 
 Without an embedding server CPersona still works (FTS5 + keyword search); adding one enables the vector-similarity layer.
+
+To serve CPersona's *remote vector search* (`CPERSONA_VECTOR_SEARCH_MODE=remote`),
+this server's `/index` + `/search` endpoints hold the vectors. v0.6.0 searches a
+per-namespace resident matrix (one matmul per query, ~21x faster than v0.5.0 at
+237k x 384: 131 ms -> 6 ms/query), so a full-corpus semantic recall stays fast at
+memory-corpus scale. When flipping an existing CPersona deployment to remote mode,
+first migrate its already-stored vectors:
+
+```bash
+python scripts/backfill_embedding_index.py \
+    --cpersona-db ~/.claude/cpersona.db \
+    --index-db data/embedding_index.db \
+    --expect-dim 768   # your embedding model's dimension
+```
+
+then restart this server so it reloads the index. Skipping the backfill silently
+drops every pre-flip memory from semantic recall (the remote branch only falls
+back to local search on HTTP errors, not on empty results).
 
 ## License
 
