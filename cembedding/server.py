@@ -42,6 +42,11 @@ EMBEDDING_TIMEOUT = int(os.environ.get("EMBEDDING_TIMEOUT_SECS", "30"))
 # Vector Index (v0.2.0)
 EMBEDDING_INDEX_ENABLED = os.environ.get("EMBEDDING_INDEX_ENABLED", "true").lower() == "true"
 EMBEDDING_INDEX_DB_PATH = os.environ.get("EMBEDDING_INDEX_DB_PATH", "data/embedding_index.db")
+# Search matmul backend (v0.5.0): "numpy" (Accelerate BLAS, default) or "mlx"
+# (Apple-GPU resident matrix; falls back to numpy when mlx is not installed).
+EMBEDDING_SEARCH_BACKEND = os.environ.get("EMBEDDING_SEARCH_BACKEND", "numpy").lower()
+if EMBEDDING_SEARCH_BACKEND not in ("numpy", "mlx"):
+    raise ValueError(f"EMBEDDING_SEARCH_BACKEND must be numpy or mlx, got {EMBEDDING_SEARCH_BACKEND}")
 
 # ONNX tokenization max sequence length (1-8192). MiniLM is clamped to 512
 # internally (positional embeddings cap). Jina-v5-nano supports up to 8192.
@@ -241,8 +246,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
                     raise FileNotFoundError(f"Failed to download ONNX model to {self._model_dir}")
             except ImportError:
                 raise FileNotFoundError(
-                    f"ONNX model not found at {model_path}. "
-                    f"Download with: python -m cembedding.download_model"
+                    f"ONNX model not found at {model_path}. Download with: python -m cembedding.download_model"
                 )
 
         providers = _select_ort_providers()
@@ -648,6 +652,13 @@ class VectorIndex:
 
     Stores vectors in SQLite for durability, loads into memory for fast
     brute-force dot product search. Namespaced to support multiple consumers.
+
+    v0.5.0: search runs on a per-namespace contiguous matrix (one matmul per
+    query) instead of a per-item Python loop — the loop dominated wall-clock
+    from a few thousand vectors up (~1.6 s/query at 237k x 384). The matrix is
+    built lazily on first search and invalidated by index/remove/purge.
+    ``EMBEDDING_SEARCH_BACKEND=mlx`` opts into Apple-GPU matmul (falls back to
+    numpy when mlx is unavailable); numpy (Accelerate BLAS) is the default.
     """
 
     def __init__(self, db_path: str):
@@ -655,6 +666,10 @@ class VectorIndex:
         self._db = None
         # In-memory index: {namespace: {item_id: np.array(float32)}}
         self._index: dict[str, dict[str, np.ndarray]] = {}
+        # Search-matrix cache: {namespace: {dim: (matrix N x dim, [item_id, ...])}}.
+        # Rows keep self._index insertion order so scores/ties match the
+        # per-item loop this replaced. Invalidated (popped) on any write.
+        self._matrix_cache: dict[str, dict[int, tuple[np.ndarray, list[str]]]] = {}
 
     async def initialize(self) -> None:
         import aiosqlite
@@ -698,6 +713,7 @@ class VectorIndex:
         texts = [item["text"] for item in items]
         embeddings = await provider.embed(texts)
 
+        self._matrix_cache.pop(namespace, None)
         if namespace not in self._index:
             self._index[namespace] = {}
 
@@ -737,19 +753,74 @@ class VectorIndex:
         query_vec = np.array(embeddings[0], dtype=np.float32)
         query_dim = len(query_vec)
 
-        candidates = []
-        for item_id, vec in ns_index.items():
-            if len(vec) != query_dim:
-                continue
-            sim = float(np.dot(query_vec, vec))
-            if sim >= min_similarity:
-                candidates.append((sim, item_id))
+        matrix, ids = self._get_search_matrix(namespace, query_dim)
+        if matrix is None:
+            return []
+        sims = self._matmul(matrix, query_vec)
 
-        # Top-K via heap
-        import heapq
+        # Vectorized threshold + top-K. A stable descending sort keeps
+        # insertion order among equal scores — the same tie behavior as the
+        # heapq.nlargest over an insertion-ordered candidate list it replaced.
+        hits = np.nonzero(sims >= min_similarity)[0]
+        if limit <= 0 or hits.size == 0:
+            return []
+        if hits.size > limit:
+            hits = hits[np.argpartition(sims[hits], -limit)[-limit:]]
+            hits.sort()  # restore insertion order so the stable sort's tie order matches
+        order = hits[np.argsort(-sims[hits], kind="stable")]
+        return [{"id": ids[i], "score": round(float(sims[i]), 4)} for i in order]
 
-        top_k = heapq.nlargest(limit, candidates, key=lambda x: x[0])
-        return [{"id": item_id, "score": round(score, 4)} for score, item_id in top_k]
+    def _get_search_matrix(self, namespace: str, dim: int) -> tuple[object, list[str]]:
+        """Return the cached (matrix, ids) for a namespace+dimension, building lazily.
+
+        Rows follow self._index insertion order, so candidate order (and
+        therefore heapq tie behavior) matches the per-item loop this replaced.
+        Vectors of other dimensions are excluded, like the loop's len() skip.
+        """
+        groups = self._matrix_cache.get(namespace)
+        if groups is None:
+            ns_index = self._index.get(namespace)
+            if not ns_index:
+                return None, []
+            by_dim: dict[int, tuple[list[np.ndarray], list[str]]] = {}
+            for item_id, vec in ns_index.items():
+                vecs, ids = by_dim.setdefault(len(vec), ([], []))
+                vecs.append(vec)
+                ids.append(item_id)
+            groups = {
+                d: (self._to_backend(np.ascontiguousarray(np.stack(vecs), dtype=np.float32)), ids)
+                for d, (vecs, ids) in by_dim.items()
+            }
+            self._matrix_cache[namespace] = groups
+        entry = groups.get(dim)
+        if entry is None:
+            return None, []
+        return entry
+
+    @staticmethod
+    def _to_backend(matrix: np.ndarray):
+        """Convert a freshly built matrix to the search backend's resident form.
+
+        mlx arrays live in unified memory, so converting once at cache-build
+        time (not per query) is what makes the GPU path pay off.
+        """
+        if EMBEDDING_SEARCH_BACKEND == "mlx":
+            try:
+                import mlx.core as mx
+
+                return mx.array(matrix)
+            except ImportError:
+                logger.warning("EMBEDDING_SEARCH_BACKEND=mlx but mlx is not installed — using numpy")
+        return matrix
+
+    @staticmethod
+    def _matmul(matrix, query_vec: np.ndarray) -> np.ndarray:
+        """One similarity pass over the namespace matrix (numpy or mlx resident)."""
+        if not isinstance(matrix, np.ndarray):  # mlx resident matrix
+            import mlx.core as mx
+
+            return np.asarray(mx.matmul(matrix, mx.array(query_vec)))
+        return matrix @ query_vec
 
     async def remove(self, namespace: str, ids: list[str]) -> int:
         """Remove items from index. Returns count removed."""
@@ -757,6 +828,7 @@ class VectorIndex:
             raise RuntimeError("VectorIndex not initialized")
 
         removed = 0
+        self._matrix_cache.pop(namespace, None)
         ns_index = self._index.get(namespace, {})
         for item_id in ids:
             cursor = await self._db.execute(
@@ -777,6 +849,7 @@ class VectorIndex:
 
         cursor = await self._db.execute("DELETE FROM vectors WHERE namespace = ?", (namespace,))
         await self._db.commit()
+        self._matrix_cache.pop(namespace, None)
         removed = len(self._index.pop(namespace, {}))
         return max(cursor.rowcount, removed)
 
@@ -789,6 +862,7 @@ class VectorIndex:
             await self._db.close()
             self._db = None
         self._index.clear()
+        self._matrix_cache.clear()
 
 
 _vector_index: VectorIndex | None = None
