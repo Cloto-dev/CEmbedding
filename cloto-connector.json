@@ -1,0 +1,93 @@
+{
+  "spec_version": 1,
+  "connector_type": "mgp_server",
+  "id": "cembedding",
+  "name": "CEmbedding",
+  "description": "Local-first embedding server: vector generation + index/search over HTTP (ONNX on-device or API providers). The reference /embed and remote /search server for CPersona.",
+  "version": "0.6.0",
+  "category": "tool",
+  "trust_level": "core",
+  "magic_seal": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "install": {
+    "source": {
+      "type": "git",
+      "url": "https://github.com/Cloto-dev/CEmbedding",
+      "reference": "",
+      "subdir": null
+    },
+    "package_manager": "uv",
+    "runtime": "python",
+    "directory": "",
+    "dependencies": [],
+    "bin_name": null
+  },
+  "icon": "layers",
+  "tags": [
+    "embedding",
+    "vector",
+    "search",
+    "onnx"
+  ],
+  "host_compatibility": [
+    "clotocore",
+    "claude-code",
+    "claude-desktop",
+    "cursor",
+    "project-airi"
+  ],
+  "env_vars": [],
+  "optional_env_vars": [
+    {
+      "name": "EMBEDDING_PROVIDER",
+      "default": "api_openai",
+      "description": "Embedding provider: api_openai | onnx_miniml | onnx_jina_v5_nano | onnx_bge_m3 | mlx_bge_m3."
+    },
+    {
+      "name": "EMBEDDING_HTTP_PORT",
+      "default": "8401",
+      "description": "HTTP port for /embed and the vector-index endpoints."
+    },
+    {
+      "name": "EMBEDDING_INDEX_ENABLED",
+      "default": "true",
+      "description": "Enable the persistent vector index endpoints (/index, /search, /remove, /purge)."
+    },
+    {
+      "name": "EMBEDDING_INDEX_DB_PATH",
+      "default": "data/embedding_index.db",
+      "description": "SQLite file backing the vector index."
+    },
+    {
+      "name": "EMBEDDING_SEARCH_BACKEND",
+      "default": "numpy",
+      "description": "/search matmul backend: numpy (Accelerate BLAS) or mlx (Apple-GPU resident matrix; numpy fallback when mlx is absent). v0.6.0."
+    },
+    {
+      "name": "ONNX_MODEL_DIR",
+      "default": "",
+      "description": "Override the model directory for ONNX providers (auto-resolved by provider when empty)."
+    },
+    {
+      "name": "ONNX_EP_PREFERENCE",
+      "default": "",
+      "description": "ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured)."
+    },
+    {
+      "name": "ONNX_MAX_SEQ_LEN",
+      "default": "2048",
+      "description": "Max tokenization length (1-8192; MiniLM clamped to 512 internally)."
+    },
+    {
+      "name": "EMBEDDING_API_KEY",
+      "default": "",
+      "description": "Required for the api_openai provider."
+    },
+    {
+      "name": "EMBEDDING_API_URL",
+      "default": "https://api.openai.com/v1/embeddings",
+      "description": "API endpoint for the api_openai provider."
+    }
+  ],
+  "auto_restart": true,
+  "changelog": "v0.6.0: /search runs one matmul over a per-namespace resident matrix instead of a per-item Python loop, with vectorized threshold + top-K selection (~21x at 237k x 384: 131 ms -> 6 ms/query). New EMBEDDING_SEARCH_BACKEND env (numpy default, mlx = Apple-GPU resident matrix with numpy fallback). New scripts/backfill_embedding_index.py migrates existing cpersona embedding blobs into the index so a deployment can flip CPERSONA_VECTOR_SEARCH_MODE=remote without losing pre-flip semantic recall. Adds the test suite (12 tests) and CI the repo lacked since extraction.\n\nv0.5.0: PyPI packaging release — flat layout restructured into the cembedding/ package with console scripts (cembedding, cembedding-download-model); published to PyPI as 'cembedding'. Functionally identical to clotohub-servers servers/embedding 0.4.0, from which this repository was extracted on 2026-06-28.\n\nv0.4.0 and earlier: see the clotohub-servers repository history (servers/embedding)."
+}
