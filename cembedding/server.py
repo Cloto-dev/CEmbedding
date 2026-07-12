@@ -260,7 +260,11 @@ class OnnxMiniLMProvider(EmbeddingProvider):
                 "MiniLM max_position=512, clamping ONNX_MAX_SEQ_LEN=%d to 512",
                 ONNX_MAX_SEQ_LEN,
             )
-        self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]", length=miniml_seq_len)
+        # Pad to the longest sequence in the batch (length=None), not to a fixed
+        # max length: fixed-length padding makes every forward pass cost the
+        # full max_seq_len regardless of input size (~14x slower for short
+        # texts). Output is unchanged — pooling honors the attention mask.
+        self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
         self._tokenizer.enable_truncation(max_length=miniml_seq_len)
 
         logger.info(
@@ -485,7 +489,9 @@ class OnnxBgeM3Provider(EmbeddingProvider):
         self._tokenizer = Tokenizer.from_file(tokenizer_path)
         bge_seq_len = min(ONNX_MAX_SEQ_LEN, 8192)
         # XLM-RoBERTa pad token is <pad> (id=1)
-        self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>", length=bge_seq_len)
+        # Pad to longest in batch (see the MiniLM provider note): fixed-length
+        # padding cost the full max_seq_len on every call; output unchanged.
+        self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=bge_seq_len)
 
         logger.info(
@@ -585,7 +591,9 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         self._session = self._create_session_with_fallback(model_path, providers)
         self._tokenizer = Tokenizer.from_file(tokenizer_path)
         # jina-v5-nano supports up to 8K context via RoPE.
-        self._tokenizer.enable_padding(pad_id=0, pad_token="<pad>", length=ONNX_MAX_SEQ_LEN)
+        # Pad to longest in batch (see the MiniLM provider note): fixed-length
+        # padding cost the full max_seq_len on every call; output unchanged.
+        self._tokenizer.enable_padding(pad_id=0, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=ONNX_MAX_SEQ_LEN)
 
         logger.info(
