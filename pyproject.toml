@@ -1,6 +1,6 @@
 [project]
 name = "cembedding"
-version = "0.6.0"
+version = "0.6.1"
 description = "Local-first embedding server: vector generation + index/search over HTTP (ONNX on-device or API providers). The reference /embed server for CPersona."
 readme = "README.md"
 requires-python = ">=3.10"
