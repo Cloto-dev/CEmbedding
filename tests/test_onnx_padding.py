@@ -19,7 +19,9 @@ import pytest
 
 MODEL_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "models", "jina-embeddings-v5-text-nano",
+    "data",
+    "models",
+    "jina-embeddings-v5-text-nano",
 )
 
 pytestmark = pytest.mark.skipif(
@@ -54,9 +56,7 @@ def test_embeddings_match_fixed_length_padding():
     import onnxruntime as ort
     from tokenizers import Tokenizer
 
-    sess = ort.InferenceSession(
-        os.path.join(MODEL_DIR, "model.onnx"), providers=["CPUExecutionProvider"]
-    )
+    sess = ort.InferenceSession(os.path.join(MODEL_DIR, "model.onnx"), providers=["CPUExecutionProvider"])
     input_names = [i.name for i in sess.get_inputs()]
 
     def embed(fixed_len):
