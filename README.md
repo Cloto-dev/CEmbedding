@@ -77,6 +77,7 @@ Set `EMBEDDING_PROVIDER`:
 | `onnx_bge_m3` | bge-m3 | Local CPU, larger / multilingual |
 | `onnx_miniml` | all-MiniLM-L6-v2 (22M, 384d) | Local CPU, smallest |
 | `mlx_bge_m3` | bge-m3 (MLX) | Apple Silicon only — `pip install ".[mlx]"` |
+| `auto_bge_m3` | bge-m3 | Auto-selects MLX on Apple Silicon, ONNX elsewhere |
 | `api_openai` | provider's model | OpenAI-compatible API; needs `EMBEDDING_API_KEY` (+ optional `EMBEDDING_API_URL`, `EMBEDDING_MODEL`) |
 
 Download a local model with `cembedding-download-model --model {miniml,jina-v5-nano,bge-m3}` (or `python -m cembedding.download_model ...` from a source checkout; fetched from HuggingFace into `./data/models`, not committed to this repo).
