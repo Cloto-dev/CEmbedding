@@ -7,6 +7,22 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "ClotoCore Project", email = "ClotoCore@proton.me" }]
 keywords = ["embedding", "mcp", "onnx", "vector-search", "jina", "bge-m3"]
+# PyPI renders these as the sidebar facets (License / Topic / Intended
+# Audience). The field was empty until 0.6.3, so the package appeared in none
+# of PyPI's faceted searches. Python versions list what CI exercises (3.10,
+# 3.12) plus 3.11 between them; requires-python still admits any 3.10+.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
 dependencies = [
     "mcp>=1.0.0,<1.27.0",
     "httpx>=0.27.0",
@@ -30,8 +46,14 @@ line-length = 120
 extend-exclude = ["cembedding/_vendored_mcp_common"]
 
 [project.urls]
+# Rendered in the PyPI sidebar. Issues is the one that closes the loop: a user
+# who installs from PyPI and hits a defect otherwise has no path back here.
+# Changelog points at Releases because this repository keeps no CHANGELOG.md.
 Homepage = "https://github.com/Cloto-dev/CEmbedding"
 Repository = "https://github.com/Cloto-dev/CEmbedding"
+Issues = "https://github.com/Cloto-dev/CEmbedding/issues"
+Changelog = "https://github.com/Cloto-dev/CEmbedding/releases"
+Documentation = "https://github.com/Cloto-dev/CEmbedding#readme"
 
 [project.scripts]
 cembedding = "cembedding.server:run"

@@ -7,7 +7,7 @@
 Vector embeddings over a tiny HTTP contract.
 On-device ONNX or any OpenAI-compatible API. The reference `/embed` server for [CPersona](https://github.com/Cloto-dev/CPersona).
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Cloto-dev/CEmbedding/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)]()
 
 </div>
@@ -153,6 +153,18 @@ then restart this server so it reloads the index. Skipping the backfill silently
 drops every pre-flip memory from semantic recall (the remote branch only falls
 back to local search on HTTP errors, not on empty results).
 
+## Found a bug, or something the docs do not explain?
+
+Open an issue — [bug report](https://github.com/Cloto-dev/CEmbedding/issues/new?template=bug_report.yml)
+or [feature request](https://github.com/Cloto-dev/CEmbedding/issues/new?template=feature_request.yml).
+
+Reports are welcome even when you are not certain it is a bug. If it turns out
+to be a configuration problem, that is still useful signal — it means the
+documentation was unclear, which is a defect of its own. Security
+vulnerabilities are the one exception: please report those privately through
+[GitHub Security Advisories](https://github.com/Cloto-dev/CEmbedding/security/advisories/new)
+rather than in a public issue.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Cloto-dev/CEmbedding/blob/main/LICENSE).

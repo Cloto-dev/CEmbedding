@@ -1,0 +1,86 @@
+name: Bug report
+description: Report something that does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Fill in what you can — a
+        partial report is far more useful than no report.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: >
+        The request, command, or configuration that triggers it. A minimal
+        curl against /embed is ideal when the problem is server-side.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: false
+
+  - type: input
+    id: cembedding-version
+    attributes:
+      label: cembedding version
+      description: "`pip show cembedding`"
+      placeholder: "0.6.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: The value of EMBEDDING_PROVIDER.
+      options:
+        - onnx_jina_v5_nano
+        - onnx_bge_m3
+        - onnx_miniml
+        - api_openai
+        - Other / not sure
+    validations:
+      required: false
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which surface
+      options:
+        - HTTP endpoint (/embed)
+        - Index / search
+        - MCP tools
+        - Model download
+        - Other / not sure
+    validations:
+      required: false
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version and OS
+      placeholder: "3.12 on Ubuntu 24.04 / 3.10 on macOS 15"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: >
+        Server output, stack traces, or the failing response body.
+        Automatically formatted as code, so no backticks needed.
+      render: shell
+    validations:
+      required: false
