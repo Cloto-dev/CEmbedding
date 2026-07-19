@@ -23,6 +23,12 @@ from mcp.server.stdio import stdio_server
 
 
 from cembedding._vendored_mcp_common.mcp_utils import ToolRegistry
+from cembedding.auth import (
+    BearerTokenMiddleware,
+    aiohttp_bearer_middleware,
+    check_startup,
+    resolve_auth_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1068,7 +1074,11 @@ async def handle_purge(request: web.Request) -> web.Response:
 
 async def run_http_server(port: int) -> None:
     """Run the HTTP embedding endpoint alongside MCP stdio."""
-    app = web.Application()
+    auth_token = resolve_auth_token()
+    check_startup("REST endpoint", f"127.0.0.1:{port}", auth_token)
+
+    middlewares = [aiohttp_bearer_middleware(auth_token)] if auth_token else []
+    app = web.Application(middlewares=middlewares)
     app.router.add_post("/embed", handle_embed)
     if EMBEDDING_INDEX_ENABLED and _vector_index is not None:
         app.router.add_post("/index", handle_index)
@@ -1313,6 +1323,13 @@ async def _run_streamable_http() -> None:
     from starlette.middleware.cors import CORSMiddleware
     from starlette.routing import Mount
 
+    host = os.environ.get("EMBEDDING_MCP_HTTP_HOST", "0.0.0.0")
+    port = int(os.environ.get("EMBEDDING_MCP_HTTP_PORT", "8403"))
+    # Checked before the provider loads a model: an auth misconfiguration
+    # should fail in milliseconds, not after an ONNX warm-up.
+    auth_token = resolve_auth_token()
+    check_startup("Streamable HTTP MCP", f"{host}:{port}", auth_token)
+
     _provider = create_provider()
     await _provider.initialize()
 
@@ -1355,12 +1372,13 @@ async def _run_streamable_http() -> None:
                 ],
                 expose_headers=["Mcp-Session-Id"],
             ),
+            # Inside CORS so 401s still carry the CORS headers a browser
+            # client needs to read them.
+            Middleware(BearerTokenMiddleware, auth_token=auth_token),
         ],
         lifespan=lifespan,
     )
 
-    host = os.environ.get("EMBEDDING_MCP_HTTP_HOST", "0.0.0.0")
-    port = int(os.environ.get("EMBEDDING_MCP_HTTP_PORT", "8403"))
     logger.info("Starting Embedding Streamable HTTP MCP on %s:%d", host, port)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info")

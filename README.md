@@ -96,6 +96,32 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
 | `EMBEDDING_API_KEY` | — | Required for `api_openai` |
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
+| `CEMBEDDING_AUTH_TOKEN` | — | Inbound bearer token. Unset = no authentication (see below) |
+| `CEMBEDDING_REQUIRE_AUTH` | `false` | Refuse to start when no token is configured |
+
+## Authentication (v0.6.2)
+
+Both HTTP surfaces — the REST endpoints (`/embed`, `/index`, `/search`,
+`/remove`, `/purge`) and the Streamable HTTP MCP transport — accept an inbound
+bearer token:
+
+```bash
+CEMBEDDING_AUTH_TOKEN=$(openssl rand -hex 32)
+```
+
+With the token set, every request must carry `Authorization: Bearer <token>`;
+a missing header, a wrong scheme and a wrong token are all rejected with `401`.
+Comparison is constant-time. With the token unset, requests are served exactly
+as in earlier versions and a warning is logged — set `CEMBEDDING_REQUIRE_AUTH=true`
+to turn that warning into a startup error instead. Requiring a token is opt-in
+in this release so existing deployments keep working; a later release will make
+it the default.
+
+**Do not treat the bind address as the security boundary.** The REST surface
+binds loopback and the MCP transport binds `0.0.0.0` by default, but a tunnel or
+reverse proxy forwards to loopback all the same, so a loopback bind is no
+evidence that requests are local. If the process is reachable through a tunnel,
+a proxy, or any non-loopback interface, configure a token.
 
 ## Use with CPersona
 

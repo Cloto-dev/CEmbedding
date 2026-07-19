@@ -4,7 +4,7 @@
   "id": "cembedding",
   "name": "CEmbedding",
   "description": "Local-first embedding server: vector generation + index/search over HTTP (ONNX on-device or API providers). The reference /embed and remote /search server for CPersona.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "category": "tool",
   "trust_level": "core",
   "magic_seal": "sha256:4c2000cf36a19c6235623d5e467f419e63286ef633b1de20fb5600857ba179fd",
@@ -86,8 +86,18 @@
       "name": "EMBEDDING_API_URL",
       "default": "https://api.openai.com/v1/embeddings",
       "description": "API endpoint for the api_openai provider."
+    },
+    {
+      "name": "CEMBEDDING_AUTH_TOKEN",
+      "default": "",
+      "description": "Inbound bearer token required on every HTTP request (REST endpoints and the Streamable HTTP MCP transport). Empty = unauthenticated, which is safe only when nothing but this machine can reach the process — a tunnel or reverse proxy forwards to loopback, so a loopback bind is not evidence of that. v0.6.2."
+    },
+    {
+      "name": "CEMBEDDING_REQUIRE_AUTH",
+      "default": "false",
+      "description": "Refuse to start when CEMBEDDING_AUTH_TOKEN is empty, instead of starting unauthenticated with a warning. v0.6.2."
     }
   ],
   "auto_restart": true,
-  "changelog": "v0.6.1: ONNX providers now pad each batch to its longest sequence instead of a fixed ONNX_MAX_SEQ_LEN. Fixed-length padding made every forward pass cost the full max length (default 2048) regardless of input size: a short recall query encoded in ~617 ms; pad-to-longest brings it to ~7 ms (~90x) and batch document encode from ~0.5 to ~460 docs/s, with bit-identical embeddings (pooling honors the attention mask; parity verified to cosine 1.0). Affects all three local ONNX providers (jina-v5-nano, bge-m3, MiniLM). Adds padding-regression tests.\n\nv0.6.0: /search runs one matmul over a per-namespace resident matrix instead of a per-item Python loop, with vectorized threshold + top-K selection (~21x at 237k x 384: 131 ms -> 6 ms/query). New EMBEDDING_SEARCH_BACKEND env (numpy default, mlx = Apple-GPU resident matrix with numpy fallback). New scripts/backfill_embedding_index.py migrates existing cpersona embedding blobs into the index so a deployment can flip CPERSONA_VECTOR_SEARCH_MODE=remote without losing pre-flip semantic recall. Adds the test suite (12 tests) and CI the repo lacked since extraction.\n\nv0.5.0: PyPI packaging release — flat layout restructured into the cembedding/ package with console scripts (cembedding, cembedding-download-model); published to PyPI as 'cembedding'. Functionally identical to clotohub-servers servers/embedding 0.4.0, from which this repository was extracted on 2026-06-28.\n\nv0.4.0 and earlier: see the clotohub-servers repository history (servers/embedding)."
+  "changelog": "v0.6.2: SECURITY — both HTTP surfaces now support inbound bearer authentication, which they previously had no mechanism for at all. Set CEMBEDDING_AUTH_TOKEN and every request to the REST endpoints (/embed, /index, /search, /remove, /purge) and to the Streamable HTTP MCP transport must carry 'Authorization: Bearer <token>'; missing headers, wrong schemes and wrong tokens are all rejected with 401, compared with hmac.compare_digest. The change is additive: with no token configured the server behaves exactly as 0.6.1 and logs a warning, and CEMBEDDING_REQUIRE_AUTH=true turns that warning into a startup error for operators who want fail-closed today. A later release will make requiring a token the default. The warning deliberately states that a loopback bind is not evidence that requests are local — a tunnel or reverse proxy forwards to loopback, which is how the sibling CPersona server ran publicly reachable and unauthenticated for 13 days. 40 regression tests drive the real middleware at the ASGI and aiohttp layers.\\n\\nv0.6.1: ONNX providers now pad each batch to its longest sequence instead of a fixed ONNX_MAX_SEQ_LEN. Fixed-length padding made every forward pass cost the full max length (default 2048) regardless of input size: a short recall query encoded in ~617 ms; pad-to-longest brings it to ~7 ms (~90x) and batch document encode from ~0.5 to ~460 docs/s, with bit-identical embeddings (pooling honors the attention mask; parity verified to cosine 1.0). Affects all three local ONNX providers (jina-v5-nano, bge-m3, MiniLM). Adds padding-regression tests.\n\nv0.6.0: /search runs one matmul over a per-namespace resident matrix instead of a per-item Python loop, with vectorized threshold + top-K selection (~21x at 237k x 384: 131 ms -> 6 ms/query). New EMBEDDING_SEARCH_BACKEND env (numpy default, mlx = Apple-GPU resident matrix with numpy fallback). New scripts/backfill_embedding_index.py migrates existing cpersona embedding blobs into the index so a deployment can flip CPERSONA_VECTOR_SEARCH_MODE=remote without losing pre-flip semantic recall. Adds the test suite (12 tests) and CI the repo lacked since extraction.\n\nv0.5.0: PyPI packaging release — flat layout restructured into the cembedding/ package with console scripts (cembedding, cembedding-download-model); published to PyPI as 'cembedding'. Functionally identical to clotohub-servers servers/embedding 0.4.0, from which this repository was extracted on 2026-06-28.\n\nv0.4.0 and earlier: see the clotohub-servers repository history (servers/embedding)."
 }
