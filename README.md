@@ -73,7 +73,7 @@ Set `EMBEDDING_PROVIDER`:
 
 | Value | Model | Notes |
 |-------|-------|-------|
-| `onnx_jina_v5_nano` | jina-v5-nano (33M, 768d) | Local CPU, what CPersona is benchmarked against |
+| `onnx_jina_v5_nano` | jina-embeddings-v5-text-nano-retrieval (~212M params in the fp32 ONNX graph, 768d) | Local CPU, what CPersona is benchmarked against |
 | `onnx_bge_m3` | bge-m3 | Local CPU, larger / multilingual |
 | `onnx_miniml` | all-MiniLM-L6-v2 (22M, 384d) | Local CPU, smallest |
 | `mlx_bge_m3` | bge-m3 (MLX) | Apple Silicon only — `pip install ".[mlx]"` |
