@@ -94,6 +94,8 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `ONNX_MODEL_DIR` | (auto) | Override the model directory for ONNX providers |
 | `ONNX_EP_PREFERENCE` | (auto) | ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured) |
 | `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
+| `ONNX_INTRA_OP_THREADS` | `0` | ONNX Runtime intra-op threads. `0` = runtime default (physical cores). Set it when the process runs under a CPU quota the runtime cannot see (container limit, shared host) |
+| `ONNX_GRAPH_OPT_LEVEL` | `all` | ONNX Runtime graph optimization: `disable` / `basic` / `extended` / `all`. Lower it only to compare against an un-fused graph |
 | `EMBEDDING_API_KEY` | — | Required for `api_openai` |
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
 | `CEMBEDDING_AUTH_TOKEN` | — | Inbound bearer token. Unset = no authentication (see below) |
