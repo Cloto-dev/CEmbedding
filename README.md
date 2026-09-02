@@ -91,6 +91,10 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `EMBEDDING_INDEX_ENABLED` | `true` | Enable the persistent vector index endpoints (`/index`, `/search`, `/remove`, `/purge`) |
 | `EMBEDDING_INDEX_DB_PATH` | `data/embedding_index.db` | SQLite file backing the vector index |
 | `EMBEDDING_SEARCH_BACKEND` | `numpy` | `/search` matmul backend. `numpy` (Accelerate BLAS) or `mlx` (Apple-GPU resident matrix; falls back to numpy when mlx is absent) |
+| `EMBEDDING_SIDECAR` | `auto` | Startup source for the resident vectors: `auto` uses the sidecar file (see below), `off` always reads them from SQLite |
+| `EMBEDDING_SIDECAR_PATH` | `<index db>.sidecar` | Where the sidecar file lives |
+| `EMBEDDING_SIDECAR_MIN_ROWS` | `10000` | Smallest corpus that gets a sidecar; below it the in-memory index is cheap enough that a file adds nothing |
+| `EMBEDDING_SIDECAR_MAX_TAIL` | `0.25` | Rebuild when the rows written since the last build exceed this fraction of the rows in the file |
 | `ONNX_MODEL_DIR` | (auto) | Override the model directory for ONNX providers |
 | `ONNX_EP_PREFERENCE` | (auto) | ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured) |
 | `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
@@ -100,6 +104,29 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
 | `CEMBEDDING_AUTH_TOKEN` | — | Inbound bearer token. Unset = no authentication (see below) |
 | `CEMBEDDING_REQUIRE_AUTH` | `false` | Refuse to start when no token is configured |
+
+## Startup: the sidecar file
+
+Loading the index from SQLite copies every stored blob into a matrix, which
+costs time and memory proportional to the corpus at every start. With
+`EMBEDDING_SIDECAR=auto` (the default) the same rows are also kept in a file
+laid out the way the search matrix already is, and a start maps it instead of
+decoding the corpus. At 100,000 vectors of 768 dimensions on an Apple laptop
+that is 0.09s to the first search instead of 0.22s, at 403 MiB of peak resident
+memory instead of 1.1 GiB.
+
+SQLite stays the durable record and decides every disagreement. The file is
+written at startup once the corpus reaches `EMBEDDING_SIDECAR_MIN_ROWS`, and
+again when the rows written since the last build outgrow
+`EMBEDDING_SIDECAR_MAX_TAIL`; rows written after a build are read from SQLite
+and are never invisible. Deleting the file costs the next start a full read and
+nothing else, and a file that is truncated, foreign or unreadable is ignored
+with the reason logged.
+
+```bash
+cembedding-sidecar status --db data/embedding_index.db   # present? usable? how stale?
+cembedding-sidecar build  --db data/embedding_index.db   # write one now
+```
 
 ## Authentication (v0.6.2)
 

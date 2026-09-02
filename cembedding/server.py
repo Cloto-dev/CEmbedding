@@ -20,6 +20,7 @@ import numpy as np
 from aiohttp import web
 from mcp.server.stdio import stdio_server
 
+from cembedding import sidecar
 from cembedding._vendored_mcp_common.mcp_utils import ToolRegistry
 from cembedding.auth import (
     BearerTokenMiddleware,
@@ -694,43 +695,122 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
 
 
 class _VectorGroup:
-    """The resident vectors of one (namespace, dimension), in a single matrix.
+    """The resident vectors of one (namespace, dimension), in two segments.
 
-    Rows ``[0, n)`` are in use and ``live`` says which of them still belong to
-    an item. Writes never permute rows: an overwrite rewrites the item's own
-    row, an append takes the next free row, and a removal only clears the
-    liveness flag. That matters beyond speed — search breaks score ties by row
-    order, so keeping positions stable keeps results stable. Tombstoned rows
-    are reclaimed by ``maybe_compact`` once they outnumber the live ones, which
-    bounds the wasted memory at half the matrix while still preserving the
-    relative order of everything that survives.
+    The **base** is the read-only snapshot a sidecar file was mapped from: its
+    rows are never written, and a removal or an overwrite only clears the
+    liveness flag it keeps in memory. The **tail** is the in-memory matrix that
+    receives every write. Rows ``[0, n)`` of the tail are in use and ``live``
+    says which of them still belong to an item.
+
+    Writes never permute rows: an overwrite rewrites the item's own tail row,
+    an append takes the next free row, and a removal only clears a flag. That
+    matters beyond speed — search breaks score ties by row order, so keeping
+    positions stable keeps results stable. A search concatenates the two
+    segments base-first, which is the order the rows were read from SQLite, so
+    the concatenated scores tie exactly as one matrix over the same rows would.
+
+    Tombstoned tail rows are reclaimed by ``maybe_compact`` once they outnumber
+    the live ones, which bounds the wasted memory at half the matrix while
+    preserving the relative order of everything that survives. Base tombstones
+    are not reclaimed; they cost a masked multiply until the next build.
     """
 
-    __slots__ = ("_backend_matrix", "_dirty", "dead", "dim", "ids", "live", "matrix", "n", "rows")
+    __slots__ = (
+        "_backend_matrix",
+        "_base_backend",
+        "_dirty",
+        "base_dead",
+        "base_ids",
+        "base_live",
+        "base_matrix",
+        "base_rows",
+        "dead",
+        "dim",
+        "ids",
+        "live",
+        "matrix",
+        "n",
+        "rows",
+    )
 
     #: Smallest matrix allocation; below this the doubling is not worth the copies.
     MIN_CAPACITY = 64
 
     def __init__(self, dim: int, capacity: int = 0):
         self.dim = dim
-        self.matrix = np.zeros((max(capacity, self.MIN_CAPACITY), dim), dtype=np.float32)
+        # Without a stated capacity the tail starts with no allocation at all:
+        # a group whose rows all come from a sidecar may never take a write,
+        # and a spare block per (namespace, dimension) would then cost more
+        # than the rows the group holds.
+        rows = max(capacity, self.MIN_CAPACITY) if capacity else 0
+        self.matrix = np.zeros((rows, dim), dtype=np.float32)
         self.ids: list[str] = []
         self.rows: dict[str, int] = {}
         self.live = np.zeros(self.matrix.shape[0], dtype=bool)
         self.n = 0
         self.dead = 0
-        # Resident copy for a non-numpy backend, rebuilt lazily after writes.
+        # The base segment stays empty unless a sidecar was mapped into it.
+        self.base_matrix: np.ndarray | None = None
+        self.base_ids: list[str] = []
+        self.base_live = np.zeros(0, dtype=bool)
+        self.base_rows: dict[str, int] = {}
+        self.base_dead = 0
+        # Resident copies for a non-numpy backend, rebuilt lazily after writes.
         self._backend_matrix = None
+        self._base_backend = None
         self._dirty = True
 
     @property
     def capacity(self) -> int:
         return self.matrix.shape[0]
 
+    @property
+    def base_count(self) -> int:
+        """Rows in the read-only segment, live or tombstoned."""
+        return len(self.base_ids)
+
+    @property
+    def live_count(self) -> int:
+        """Items this group holds, across both segments."""
+        return len(self.base_rows) + len(self.rows)
+
+    def __contains__(self, item_id: str) -> bool:
+        return item_id in self.rows or item_id in self.base_rows
+
+    def attach_base(self, ids: list[str], matrix: np.ndarray, live: np.ndarray) -> None:
+        """Install the read-only snapshot segment, with the rows startup found still current."""
+        if matrix.shape[0] != len(ids) or live.shape[0] != len(ids):
+            raise ValueError(f"base segment for dimension {self.dim} disagrees with its ids")
+        self.base_matrix = matrix
+        self.base_ids = ids
+        self.base_live = live
+        self.base_rows = {item_id: row for row, item_id in enumerate(ids) if live[row]}
+        self.base_dead = len(ids) - len(self.base_rows)
+        self._base_backend = None
+
+    def id_at(self, index: int) -> str:
+        """Resolve a row of the concatenated (base, tail) order to its item id."""
+        base = self.base_count
+        return self.base_ids[index] if index < base else self.ids[index - base]
+
+    def live_mask(self) -> np.ndarray:
+        """Liveness of the concatenated rows, in the order ``search`` scores them."""
+        tail = self.live[: self.n]
+        if not self.base_count:
+            return tail
+        if not self.n:
+            return self.base_live
+        return np.concatenate((self.base_live, tail))
+
     def put(self, item_id: str, vec: np.ndarray) -> None:
         """Insert a vector, or overwrite an existing id in place at its own row."""
         row = self.rows.get(item_id)
         if row is None:
+            # An id that lives in the base moves to the tail: a read-only
+            # mapping cannot be written, and a base that could be written would
+            # no longer be the snapshot the file holds.
+            self._tombstone_base(item_id)
             if self.n == self.capacity:
                 self._grow()
             row = self.n
@@ -745,10 +825,21 @@ class _VectorGroup:
         """Mark an id's row dead. Returns False when the id is not in this group."""
         row = self.rows.pop(item_id, None)
         if row is None:
-            return False
+            return self._tombstone_base(item_id)
         self.live[row] = False
         self.dead += 1
         self._dirty = True
+        return True
+
+    def _tombstone_base(self, item_id: str) -> bool:
+        """Clear a base row's liveness flag; the mapped bytes stay untouched."""
+        row = self.base_rows.pop(item_id, None)
+        if row is None:
+            return False
+        self.base_live[row] = False
+        self.base_dead += 1
+        # The base matrix itself did not change, so a backend copy of it is
+        # still valid: the mask is applied to the scores, not to the rows.
         return True
 
     def _grow(self) -> None:
@@ -780,7 +871,12 @@ class _VectorGroup:
         self._dirty = True
 
     def load(self, ids: list[str], block: np.ndarray) -> None:
-        """Fill an empty group from one contiguous block of rows (startup path)."""
+        """Fill an empty tail from one contiguous block of rows (startup path)."""
+        if len(ids) > self.capacity:
+            # The tail is empty at load time, so there is nothing to preserve:
+            # take an allocation that fits instead of doubling into one.
+            self.matrix = np.zeros((max(len(ids), self.MIN_CAPACITY), self.dim), dtype=np.float32)
+            self.live = np.zeros(self.matrix.shape[0], dtype=bool)
         if block.shape[0]:
             self.matrix[: block.shape[0]] = block
         self.ids = list(ids)
@@ -791,7 +887,7 @@ class _VectorGroup:
         self._dirty = True
 
     def operand(self):
-        """Return the used rows in the form the search backend multiplies."""
+        """Return the used tail rows in the form the search backend multiplies."""
         used = self.matrix[: self.n]
         if EMBEDDING_SEARCH_BACKEND != "mlx":
             return used
@@ -801,6 +897,18 @@ class _VectorGroup:
             self._backend_matrix = VectorIndex._to_backend(used)
             self._dirty = False
         return self._backend_matrix
+
+    def base_operand(self):
+        """Return the base rows in the form the search backend multiplies.
+
+        The base never changes, so a non-numpy backend converts it once, when
+        the first search touches it, and keeps that copy for the process.
+        """
+        if EMBEDDING_SEARCH_BACKEND != "mlx":
+            return self.base_matrix
+        if self._base_backend is None:
+            self._base_backend = VectorIndex._to_backend(self.base_matrix)
+        return self._base_backend
 
 
 class VectorIndex:
@@ -820,6 +928,11 @@ class VectorIndex:
 
     ``EMBEDDING_SEARCH_BACKEND=mlx`` opts into Apple-GPU matmul (falls back to
     numpy when mlx is unavailable); numpy (Accelerate BLAS) is the default.
+
+    A start can take the resident rows from a sidecar file instead of decoding
+    them out of SQLite (see ``cembedding.sidecar``). The file is derived state:
+    it is mapped when it can be trusted, ignored with a logged reason when it
+    cannot, and SQLite decides every disagreement.
     """
 
     def __init__(self, db_path: str):
@@ -827,6 +940,40 @@ class VectorIndex:
         self._db = None
         # Resident vectors: {namespace: {dimension: _VectorGroup}}
         self._groups: dict[str, dict[int, _VectorGroup]] = {}
+        # Sidecar settings, read from the environment at initialize().
+        self._sidecar_enabled = False
+        self._sidecar_off_reason = ""
+        self._sidecar_path = ""
+        self._sidecar_min_rows = 0
+        self._sidecar_max_tail = 0.0
+        # Set when rows that are in the file stopped being described by it in a
+        # way no group can still report, i.e. when a group was dropped whole.
+        self._sidecar_stale = False
+
+    def _configure_sidecar(self) -> None:
+        """Read the sidecar settings for this index.
+
+        They are read per index rather than at import so that a process can
+        open two databases with different settings, and so a test can set them
+        the way a deployment does.
+        """
+        mode = os.environ.get("EMBEDDING_SIDECAR", "auto").strip().lower()
+        if mode not in ("auto", "off"):
+            raise ValueError(f"EMBEDDING_SIDECAR must be auto or off, got {mode}")
+        self._sidecar_min_rows = int(os.environ.get("EMBEDDING_SIDECAR_MIN_ROWS", "10000"))
+        self._sidecar_max_tail = float(os.environ.get("EMBEDDING_SIDECAR_MAX_TAIL", "0.25"))
+        self._sidecar_path = sidecar.default_path(self._db_path)
+        if mode == "off":
+            self._sidecar_enabled = False
+            self._sidecar_off_reason = "EMBEDDING_SIDECAR=off"
+        elif self._db_path in ("", ":memory:") or "mode=memory" in self._db_path:
+            # An in-memory database is empty at every start and dies with the
+            # process; a file next to it would describe nothing.
+            self._sidecar_enabled = False
+            self._sidecar_off_reason = "in-memory database"
+        else:
+            self._sidecar_enabled = True
+            self._sidecar_off_reason = ""
 
     async def initialize(self) -> None:
         import aiosqlite
@@ -852,10 +999,118 @@ class VectorIndex:
         )
         await self._db.commit()
 
-        # Load all vectors into memory. Blobs are collected per group first and
-        # decoded in one pass per group: decoding them one by one would allocate
-        # an array object per vector only to copy it into the matrix and drop it.
-        rows = await self._db.execute_fetchall("SELECT namespace, item_id, vector FROM vectors")
+        self._configure_sidecar()
+        mapped, reason = self._open_sidecar()
+        base_rows = tail_rows = 0
+        if mapped is not None:
+            reconciled = await self._load_mapped(mapped)
+            if reconciled is None:
+                # SQLite holds a row at or below the watermark that is not the
+                # row the base holds for it. SQLite is right, so the whole
+                # resident set is read from it and the file is rebuilt below.
+                mapped = None
+                reason = "a row at or below the watermark is not the one the sidecar holds"
+                self._groups.clear()
+            else:
+                base_rows, tail_rows = reconciled
+        if mapped is None:
+            tail_rows = await self._load_from_sqlite()
+
+        total = base_rows + tail_rows
+        if mapped is not None:
+            logger.info(
+                "VectorIndex loaded: %d vectors across %d namespaces — sidecar mapped (%d base, %d tail, watermark %d)",
+                total,
+                len(self._groups),
+                base_rows,
+                tail_rows,
+                mapped.watermark,
+            )
+        else:
+            logger.info(
+                "VectorIndex loaded: %d vectors across %d namespaces — from SQLite (%s)",
+                total,
+                len(self._groups),
+                reason,
+            )
+
+        if self._sidecar_enabled and self._should_build_at_startup(mapped is not None, total, base_rows, tail_rows):
+            await self._rebuild_and_remap()
+
+    def _open_sidecar(self):
+        """Map the sidecar if it can be trusted; return (sidecar or None, reason)."""
+        if not self._sidecar_enabled:
+            return None, self._sidecar_off_reason
+        try:
+            mapped = sidecar.load(self._sidecar_path)
+        except sidecar.SidecarUnusable as exc:
+            return None, str(exc)
+        except OSError as exc:
+            return None, f"unreadable: {exc}"
+        return mapped, "no sidecar file" if mapped is None else ""
+
+    async def _load_mapped(self, mapped) -> tuple[int, int] | None:
+        """Install a mapped sidecar as the base of each group, then read the tail.
+
+        The watermark says which rows existed when the file was built, but not
+        which of them still exist or still carry the vector the file holds.
+        Both are answered by one ids-only read of SQLite: a base row is current
+        exactly when its (namespace, item_id) is still there at the rowid it
+        was read from. Anything else — removed, overwritten, or a rowid SQLite
+        handed to a different item after the newest row was deleted — leaves
+        the base row tombstoned before the first search.
+
+        Returns (live base rows, tail rows), or None when a row at or below the
+        watermark is not represented in the base at all. That last case is
+        rare (SQLite reuses the largest rowid once the row holding it is
+        deleted) and it cannot be repaired without putting a row that belongs
+        before the base after it, so the caller falls back to SQLite instead.
+        """
+        rows = await self._db.execute_fetchall("SELECT rowid, namespace, item_id FROM vectors")
+        current = {(ns, item_id): rowid for rowid, ns, item_id in rows}
+        below_watermark = sum(1 for rowid in current.values() if rowid <= mapped.watermark)
+
+        masks = []
+        live_total = 0
+        for group in mapped.groups:
+            live = np.fromiter(
+                (current.get((group.namespace, item_id)) == rowid for item_id, rowid in zip(group.ids, group.rowids)),
+                dtype=bool,
+                count=group.count,
+            )
+            live_total += int(live.sum())
+            masks.append(live)
+        if live_total != below_watermark:
+            return None
+
+        for group, live in zip(mapped.groups, masks):
+            resident = _VectorGroup(group.dim)
+            resident.attach_base(group.ids, group.matrix, live)
+            self._groups.setdefault(group.namespace, {})[group.dim] = resident
+
+        tail = await self._db.execute_fetchall(
+            "SELECT namespace, item_id, vector FROM vectors WHERE rowid > ? ORDER BY rowid",
+            (mapped.watermark,),
+        )
+        return live_total, self._install_tail(tail)
+
+    async def _load_from_sqlite(self) -> int:
+        """Read every vector out of SQLite into the tail of its group.
+
+        The row order is stated rather than inherited: search breaks ties by
+        row order, and rowid order is the order a sidecar build writes, so both
+        paths have to agree on it.
+        """
+        rows = await self._db.execute_fetchall("SELECT namespace, item_id, vector FROM vectors ORDER BY rowid")
+        return self._install_tail(rows)
+
+    def _install_tail(self, rows) -> int:
+        """Load rows (in order) into the tail of their group; returns the row count.
+
+        Blobs are collected per group first and decoded in one pass per group:
+        decoding them one by one would allocate an array object per vector only
+        to copy it into the matrix and drop it.
+        """
         grouped: dict[tuple[str, int], tuple[list[str], list[bytes]]] = {}
         for ns, item_id, blob in rows:
             if len(blob) % 4:
@@ -869,7 +1124,10 @@ class VectorIndex:
         total = 0
         for (ns, byte_len), (ids, blobs) in grouped.items():
             dim = byte_len // 4
-            group = _VectorGroup(dim, capacity=len(ids))
+            ns_groups = self._groups.setdefault(ns, {})
+            group = ns_groups.get(dim)
+            if group is None:
+                group = ns_groups[dim] = _VectorGroup(dim, capacity=len(ids))
             # A zero-dimension blob carries no coordinates, so there is nothing
             # to decode; the ids are still tracked so counts stay accurate.
             block = (
@@ -878,10 +1136,56 @@ class VectorIndex:
                 else np.zeros((0, 0), dtype=np.float32)
             )
             group.load(ids, block)
-            self._groups.setdefault(ns, {})[dim] = group
             total += group.n
+        return total
 
-        logger.info("VectorIndex loaded: %d vectors across %d namespaces", total, len(self._groups))
+    def _should_build_at_startup(self, mapped: bool, total: int, base_rows: int, tail_rows: int) -> bool:
+        """Whether this start should write a sidecar before serving.
+
+        Without a usable file the corpus has to be large enough to be worth
+        one: below the minimum the in-memory index is cheap and a file adds
+        nothing. With one, the tail is what a start still reads out of SQLite,
+        so a tail that has grown past its share of the base is the signal that
+        the snapshot is too old to be doing its job.
+        """
+        if mapped:
+            return tail_rows > self._sidecar_max_tail * base_rows
+        return total >= self._sidecar_min_rows
+
+    async def _build_sidecar(self) -> dict | None:
+        """Build the sidecar off the event loop. A failure is logged, never raised."""
+        try:
+            built = await asyncio.to_thread(sidecar.build, self._db_path, self._sidecar_path)
+            self._sidecar_stale = False
+            return built
+        except Exception as exc:  # a derived file is not worth failing a start or a stop over
+            logger.warning("VectorIndex could not build the sidecar %s: %s", self._sidecar_path, exc)
+            return None
+
+    async def _rebuild_and_remap(self) -> None:
+        """Write a fresh sidecar and map it, so the rows this start read are released."""
+        if await self._build_sidecar() is None:
+            return
+        self._groups.clear()
+        mapped, reason = self._open_sidecar()
+        reconciled = await self._load_mapped(mapped) if mapped is not None else None
+        if reconciled is None:
+            self._groups.clear()
+            total = await self._load_from_sqlite()
+            logger.warning(
+                "VectorIndex built %s but could not map it back (%s) — serving %d vectors from SQLite",
+                self._sidecar_path,
+                reason or "reconciliation failed",
+                total,
+            )
+            return
+        base_rows, tail_rows = reconciled
+        logger.info(
+            "VectorIndex rebuilt the sidecar %s and mapped it (%d base, %d tail)",
+            self._sidecar_path,
+            base_rows,
+            tail_rows,
+        )
 
     async def index(self, namespace: str, items: list[dict], provider: "EmbeddingProvider") -> int:
         """Index items. Each item has 'id' and 'text'. Returns count indexed."""
@@ -926,7 +1230,7 @@ class VectorIndex:
         group = ns_groups.get(dim)
         if group is None:
             group = ns_groups[dim] = _VectorGroup(dim)
-        if item_id not in group.rows:
+        if item_id not in group:
             # An id may hold only one vector, so a re-index at a new dimension
             # has to retire the row it occupies in the old dimension's group.
             for other_dim, other in ns_groups.items():
@@ -945,7 +1249,7 @@ class VectorIndex:
     ) -> list[dict]:
         """Search for similar vectors. Returns [{id, score}, ...] sorted by score desc."""
         ns_groups = self._groups.get(namespace)
-        if not ns_groups or not any(group.rows for group in ns_groups.values()):
+        if not ns_groups or not any(group.live_count for group in ns_groups.values()):
             return []
 
         embeddings = await provider.embed([query])
@@ -956,24 +1260,32 @@ class VectorIndex:
         # Vectors of another dimension are not comparable and are skipped, the
         # same exclusion the per-item loop made with a length check.
         group = ns_groups.get(int(query_vec.shape[0]))
-        if group is None or group.n == 0:
+        if group is None or (group.base_count == 0 and group.n == 0):
             return []
-        sims = self._matmul(group.operand(), query_vec)
+
+        # One pass per segment, concatenated base-first. That is the order the
+        # rows were read from SQLite, so the concatenated scores are what a
+        # single matrix over the same rows would produce, tie order included.
+        parts = []
+        if group.base_count:
+            parts.append(self._matmul(group.base_operand(), query_vec))
+        if group.n:
+            parts.append(self._matmul(group.operand(), query_vec))
+        sims = parts[0] if len(parts) == 1 else np.concatenate(parts)
 
         # Vectorized threshold + top-K. Tombstoned rows still take part in the
         # matmul (skipping them would cost a copy of the matrix) and are dropped
         # here. A stable descending sort keeps row order among equal scores —
         # the same tie behavior as the heapq.nlargest over an insertion-ordered
         # candidate list it replaced.
-        hits = np.nonzero((sims >= min_similarity) & group.live[: group.n])[0]
+        hits = np.nonzero((sims >= min_similarity) & group.live_mask())[0]
         if limit <= 0 or hits.size == 0:
             return []
         if hits.size > limit:
             hits = hits[np.argpartition(sims[hits], -limit)[-limit:]]
             hits.sort()  # restore row order so the stable sort's tie order matches
         order = hits[np.argsort(-sims[hits], kind="stable")]
-        ids = group.ids
-        return [{"id": ids[i], "score": round(float(sims[i]), 4)} for i in order]
+        return [{"id": group.id_at(i), "score": round(float(sims[i]), 4)} for i in order]
 
     @staticmethod
     def _to_backend(matrix: np.ndarray):
@@ -1024,7 +1336,10 @@ class VectorIndex:
         removed = cursor.rowcount
         await self._db.commit()
 
-        for dim in [dim for dim, group in ns_groups.items() if not group.rows]:
+        for dim in [dim for dim, group in ns_groups.items() if not group.live_count]:
+            # The group is going, and with it the record that its base rows are
+            # dead, so note here that the file no longer describes this index.
+            self._sidecar_stale = self._sidecar_stale or ns_groups[dim].base_count > 0
             del ns_groups[dim]
         for group in ns_groups.values():
             group.maybe_compact()
@@ -1037,18 +1352,42 @@ class VectorIndex:
 
         cursor = await self._db.execute("DELETE FROM vectors WHERE namespace = ?", (namespace,))
         await self._db.commit()
-        removed = sum(len(group.rows) for group in self._groups.pop(namespace, {}).values())
+        dropped = self._groups.pop(namespace, {})
+        self._sidecar_stale = self._sidecar_stale or any(group.base_count for group in dropped.values())
+        removed = sum(group.live_count for group in dropped.values())
         return max(cursor.rowcount, removed)
 
     async def count(self, namespace: str) -> int:
         """Count vectors in a namespace."""
-        return sum(len(group.rows) for group in self._groups.get(namespace, {}).values())
+        return sum(group.live_count for group in self._groups.get(namespace, {}).values())
 
     async def shutdown(self) -> None:
         if self._db:
+            # Everything written since the last build is in the tails, and the
+            # next start would read it out of SQLite again. Building here makes
+            # that start O(1); a build that fails only costs that tail read.
+            if self._should_build_at_shutdown():
+                await self._build_sidecar()
             await self._db.close()
             self._db = None
         self._groups.clear()
+
+    def _should_build_at_shutdown(self) -> bool:
+        """Whether stopping should refresh the sidecar.
+
+        Only when there is something the current file does not hold, and only
+        for an index that is meant to have one: a corpus below the minimum
+        keeps the behaviour it has without the feature, including leaving no
+        file behind.
+        """
+        if not self._sidecar_enabled:
+            return False
+        groups = [group for ns_groups in self._groups.values() for group in ns_groups.values()]
+        if not self._sidecar_stale and not any(group.n or group.base_dead for group in groups):
+            return False
+        if os.path.exists(self._sidecar_path):
+            return True
+        return sum(group.live_count for group in groups) >= self._sidecar_min_rows
 
 
 _vector_index: VectorIndex | None = None
