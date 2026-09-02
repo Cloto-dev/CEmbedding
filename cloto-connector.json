@@ -4,7 +4,7 @@
   "id": "cembedding",
   "name": "CEmbedding",
   "description": "Local-first embedding server: vector generation + index/search over HTTP (ONNX on-device or API providers). The reference /embed and remote /search server for CPersona.",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "category": "tool",
   "trust_level": "core",
   "magic_seal": "sha256:73e38571d736e44e30c1035f7ac74b11e82a8f2c6bab732ebe77ba2cdc6da3c1",
@@ -63,6 +63,26 @@
       "description": "/search matmul backend: numpy (Accelerate BLAS) or mlx (Apple-GPU resident matrix; numpy fallback when mlx is absent). v0.6.0."
     },
     {
+      "name": "EMBEDDING_SIDECAR",
+      "default": "auto",
+      "description": "Startup source for the resident vectors: 'auto' maps them from the sidecar file, 'off' always reads them from SQLite. v0.7.0."
+    },
+    {
+      "name": "EMBEDDING_SIDECAR_PATH",
+      "default": "",
+      "description": "Where the sidecar file lives. Empty = alongside the index database, named after it. v0.7.0."
+    },
+    {
+      "name": "EMBEDDING_SIDECAR_MIN_ROWS",
+      "default": "10000",
+      "description": "Smallest corpus that gets a sidecar file; below it the in-memory index is cheap enough that a file adds nothing. v0.7.0."
+    },
+    {
+      "name": "EMBEDDING_SIDECAR_MAX_TAIL",
+      "default": "0.25",
+      "description": "Rebuild the sidecar when the rows written since the last build exceed this fraction of the rows in the file. v0.7.0."
+    },
+    {
       "name": "ONNX_MODEL_DIR",
       "default": "",
       "description": "Override the model directory for ONNX providers (auto-resolved by provider when empty)."
@@ -76,6 +96,26 @@
       "name": "ONNX_MAX_SEQ_LEN",
       "default": "2048",
       "description": "Max tokenization length (1-8192; MiniLM clamped to 512 internally)."
+    },
+    {
+      "name": "EMBEDDING_MODEL_VARIANT",
+      "default": "fp32",
+      "description": "Precision of jina-v5-nano to load: fp32 / fp16 / int8, downloaded on first use. int8 saves about 280 MB of resident memory and costs four to eight times more per query; vectors already stored were produced at fp32. v0.7.0."
+    },
+    {
+      "name": "ONNX_INTRA_OP_THREADS",
+      "default": "0",
+      "description": "ONNX Runtime intra-op threads. 0 = the runtime decides. Set it when the process runs under a CPU quota the runtime cannot see (container limit, shared host); over-subscribing is slower, not faster. v0.7.0."
+    },
+    {
+      "name": "ONNX_GRAPH_OPT_LEVEL",
+      "default": "all",
+      "description": "ONNX Runtime graph optimization level: disable / basic / extended / all. Lower it only to compare against an un-fused graph. v0.7.0."
+    },
+    {
+      "name": "EMBEDDING_MAX_BATCH",
+      "default": "64",
+      "description": "Most texts one model run may carry when concurrent requests are merged into it. 0 disables merging and gives one pass per request. v0.7.0."
     },
     {
       "name": "EMBEDDING_API_KEY",
@@ -99,5 +139,5 @@
     }
   ],
   "auto_restart": true,
-  "changelog": "v0.6.2: SECURITY — both HTTP surfaces now support inbound bearer authentication, which they previously had no mechanism for at all. Set CEMBEDDING_AUTH_TOKEN and every request to the REST endpoints (/embed, /index, /search, /remove, /purge) and to the Streamable HTTP MCP transport must carry 'Authorization: Bearer <token>'; missing headers, wrong schemes and wrong tokens are all rejected with 401, compared with hmac.compare_digest. The change is additive: with no token configured the server behaves exactly as 0.6.1 and logs a warning, and CEMBEDDING_REQUIRE_AUTH=true turns that warning into a startup error for operators who want fail-closed today. A later release will make requiring a token the default. The warning deliberately states that a loopback bind is not evidence that requests are local — a tunnel or reverse proxy forwards to loopback, which is how the sibling CPersona server ran publicly reachable and unauthenticated for 13 days. 40 regression tests drive the real middleware at the ASGI and aiohttp layers.\\n\\nv0.6.1: ONNX providers now pad each batch to its longest sequence instead of a fixed ONNX_MAX_SEQ_LEN. Fixed-length padding made every forward pass cost the full max length (default 2048) regardless of input size: a short recall query encoded in ~617 ms; pad-to-longest brings it to ~7 ms (~90x) and batch document encode from ~0.5 to ~460 docs/s, with bit-identical embeddings (pooling honors the attention mask; parity verified to cosine 1.0). Affects all three local ONNX providers (jina-v5-nano, bge-m3, MiniLM). Adds padding-regression tests.\n\nv0.6.0: /search runs one matmul over a per-namespace resident matrix instead of a per-item Python loop, with vectorized threshold + top-K selection (~21x at 237k x 384: 131 ms -> 6 ms/query). New EMBEDDING_SEARCH_BACKEND env (numpy default, mlx = Apple-GPU resident matrix with numpy fallback). New scripts/backfill_embedding_index.py migrates existing cpersona embedding blobs into the index so a deployment can flip CPERSONA_VECTOR_SEARCH_MODE=remote without losing pre-flip semantic recall. Adds the test suite (12 tests) and CI the repo lacked since extraction.\n\nv0.5.0: PyPI packaging release — flat layout restructured into the cembedding/ package with console scripts (cembedding, cembedding-download-model); published to PyPI as 'cembedding'. Functionally identical to clotohub-servers servers/embedding 0.4.0, from which this repository was extracted on 2026-06-28.\n\nv0.4.0 and earlier: see the clotohub-servers repository history (servers/embedding)."
+  "changelog": "v0.7.0: Performance and footprint, with results unchanged. Startup maps the resident vectors from a contiguous file next to the index database instead of decoding every blob out of SQLite (100k x 768: 0.23 s and 1.1 GiB peak, to 0.09 s and 402 MiB); SQLite stays the durable record and the file is a cache that can be deleted. The index keeps one matrix per namespace instead of a per-item map plus a rebuilt stack, so a write no longer costs the next search a rebuild (20k x 384: 153 ms to 17 ms over 30 write+search rounds). Concurrent /embed requests that arrive while a model pass is running share the next pass instead of each paying for one (32 clients: p50 219 ms to 90 ms, 150 to 358 req/s). fp16 and int8 weights of jina-v5-nano are selectable with EMBEDDING_MODEL_VARIANT; fp32 stays the default because int8 saves about 280 MB but costs four to eight times more per query. ONNX_INTRA_OP_THREADS and ONNX_GRAPH_OPT_LEVEL configure the runtime session, both defaulting to what it did before. The one observable difference: once the sidecar splits a namespace into two segments, the two BLAS calls can accumulate in different orders, so rows whose scores tie exactly may order differently. EMBEDDING_SIDECAR=off keeps the previous startup path, EMBEDDING_MAX_BATCH=0 the previous embed path. 116 regression tests.\n\nv0.6.2: SECURITY — both HTTP surfaces now support inbound bearer authentication, which they previously had no mechanism for at all. Set CEMBEDDING_AUTH_TOKEN and every request to the REST endpoints (/embed, /index, /search, /remove, /purge) and to the Streamable HTTP MCP transport must carry 'Authorization: Bearer <token>'; missing headers, wrong schemes and wrong tokens are all rejected with 401, compared with hmac.compare_digest. The change is additive: with no token configured the server behaves exactly as 0.6.1 and logs a warning, and CEMBEDDING_REQUIRE_AUTH=true turns that warning into a startup error for operators who want fail-closed today. A later release will make requiring a token the default. The warning deliberately states that a loopback bind is not evidence that requests are local — a tunnel or reverse proxy forwards to loopback, which is how the sibling CPersona server ran publicly reachable and unauthenticated for 13 days. 40 regression tests drive the real middleware at the ASGI and aiohttp layers.\n\nv0.6.1: ONNX providers now pad each batch to its longest sequence instead of a fixed ONNX_MAX_SEQ_LEN. Fixed-length padding made every forward pass cost the full max length (default 2048) regardless of input size: a short recall query encoded in ~617 ms; pad-to-longest brings it to ~7 ms (~90x) and batch document encode from ~0.5 to ~460 docs/s, with bit-identical embeddings (pooling honors the attention mask; parity verified to cosine 1.0). Affects all three local ONNX providers (jina-v5-nano, bge-m3, MiniLM). Adds padding-regression tests.\n\nv0.6.0: /search runs one matmul over a per-namespace resident matrix instead of a per-item Python loop, with vectorized threshold + top-K selection (~21x at 237k x 384: 131 ms -> 6 ms/query). New EMBEDDING_SEARCH_BACKEND env (numpy default, mlx = Apple-GPU resident matrix with numpy fallback). New scripts/backfill_embedding_index.py migrates existing cpersona embedding blobs into the index so a deployment can flip CPERSONA_VECTOR_SEARCH_MODE=remote without losing pre-flip semantic recall. Adds the test suite (12 tests) and CI the repo lacked since extraction.\n\nv0.5.0: PyPI packaging release — flat layout restructured into the cembedding/ package with console scripts (cembedding, cembedding-download-model); published to PyPI as 'cembedding'. Functionally identical to clotohub-servers servers/embedding 0.4.0, from which this repository was extracted on 2026-06-28.\n\nv0.4.0 and earlier: see the clotohub-servers repository history (servers/embedding)."
 }
