@@ -20,7 +20,6 @@ import numpy as np
 from aiohttp import web
 from mcp.server.stdio import stdio_server
 
-
 from cembedding._vendored_mcp_common.mcp_utils import ToolRegistry
 from cembedding.auth import (
     BearerTokenMiddleware,
@@ -673,7 +672,7 @@ class _VectorGroup:
     relative order of everything that survives.
     """
 
-    __slots__ = ("dim", "matrix", "ids", "rows", "live", "n", "dead", "_backend_matrix", "_dirty")
+    __slots__ = ("_backend_matrix", "_dirty", "dead", "dim", "ids", "live", "matrix", "n", "rows")
 
     #: Smallest matrix allocation; below this the doubling is not worth the copies.
     MIN_CAPACITY = 64

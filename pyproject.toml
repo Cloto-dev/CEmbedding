@@ -45,6 +45,12 @@ testpaths = ["tests"]
 line-length = 120
 extend-exclude = ["cembedding/_vendored_mcp_common"]
 
+[tool.ruff.lint]
+# Pin the rule set instead of inheriting ruff's defaults: the CI job installs
+# whatever ruff is current, and a ruff release that widens its default rules
+# turns the gate red on untouched code (14 findings appeared at once this way).
+select = ["E4", "E7", "E9", "F", "I", "RUF023"]
+
 [project.urls]
 # Rendered in the PyPI sidebar. Issues is the one that closes the loop: a user
 # who installs from PyPI and hits a defect otherwise has no path back here.
