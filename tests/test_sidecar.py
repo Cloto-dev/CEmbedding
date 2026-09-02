@@ -407,15 +407,20 @@ async def test_an_overwrite_after_the_build_serves_the_new_vector(tmp_path, monk
 async def test_the_build_writes_an_overwritten_item_once_at_its_newest_position(tmp_path, monkeypatch):
     """INSERT OR REPLACE moves an item's rowid, and the build follows that order.
 
-    All three items score identically here, so their order in the results is
+    All three items hold the same vector, so their order in the results is
     their row order and nothing else: an item that was rewritten belongs at the
-    end, exactly where a load straight from SQLite would put it.
+    end, exactly where a load straight from SQLite would put it. The vectors
+    come from the grid provider because "the same vector" is not enough for a
+    tie on every BLAS: OpenBLAS scored three identical float rows of one matrix
+    with different last bits (the remainder rows of a block take another
+    path), which put the rewritten item first on Linux while Accelerate tied
+    them. Exactly representable coordinates make the scores equal everywhere.
     """
     db_path = tmp_path / "index.db"
     index = await open_index(monkeypatch, db_path, mode="off")
     tied = "tied text"
-    await index.index(NS_TIES, [{"id": item, "text": tied} for item in ("a", "b", "c")], P384)
-    await index.index(NS_TIES, [{"id": "b", "text": tied}], P384)  # b is rewritten, so b moves last
+    await index.index(NS_TIES, [{"id": item, "text": tied} for item in ("a", "b", "c")], G384)
+    await index.index(NS_TIES, [{"id": "b", "text": tied}], G384)  # b is rewritten, so b moves last
     await index.shutdown()
     sidecar.build(str(db_path))
 
@@ -423,7 +428,7 @@ async def test_the_build_writes_an_overwritten_item_once_at_its_newest_position(
     group = reopened._groups[NS_TIES][384]
     assert group.base_ids == ["a", "c", "b"]  # written once, at its newest position
     assert group.n == 0  # and nothing was left for the tail to re-read
-    results = await reopened.search(NS_TIES, tied, 10, 0.0, P384)
+    results = await reopened.search(NS_TIES, tied, 10, 0.0, G384)
     assert [hit["id"] for hit in results] == ["a", "c", "b"]
     await reopened.shutdown()
 
