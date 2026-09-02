@@ -60,18 +60,38 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Verify tag version matches pyproject
+      - name: Verify tag version matches the package version
         run: |
-          pyproject_version=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          # The package version lives in cembedding/__init__.py; pyproject derives
+          # it from there (hatch dynamic version), so this is the one place to read.
+          package_version=$(sed -nE 's/^__version__ = "(.*)"$/\1/p' cembedding/__init__.py | head -1)
           tag_version="${{ steps.ref.outputs.tag_version }}"
-          if [ "$pyproject_version" != "$tag_version" ]; then
-            echo "::error::tag version '$tag_version' does not match pyproject version '$pyproject_version'"
+          if [ -z "$package_version" ]; then
+            echo "::error::could not read __version__ from cembedding/__init__.py"
             exit 1
           fi
-          echo "version match: $pyproject_version"
+          if [ "$package_version" != "$tag_version" ]; then
+            echo "::error::tag version '$tag_version' does not match package version '$package_version'"
+            exit 1
+          fi
+          echo "version match: $package_version"
 
       - name: Build sdist + wheel
         run: uv build
+
+      - name: Verify the built artifacts carry the tag version
+        run: |
+          # What gets uploaded is the artifact, not the source file the step above
+          # read: this fails if the build backend ever resolves a different version.
+          tag_version="${{ steps.ref.outputs.tag_version }}"
+          for artifact in "dist/cembedding-${tag_version}-py3-none-any.whl" "dist/cembedding-${tag_version}.tar.gz"; do
+            if [ ! -f "$artifact" ]; then
+              echo "::error::expected $artifact; built instead:"
+              ls -1 dist
+              exit 1
+            fi
+          done
+          echo "artifacts match: $(ls -1 dist | tr '\n' ' ')"
 
       - name: Publish to PyPI (OIDC Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
