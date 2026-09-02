@@ -58,6 +58,19 @@ ONNX_MAX_SEQ_LEN = int(os.environ.get("ONNX_MAX_SEQ_LEN", "2048"))
 if not (1 <= ONNX_MAX_SEQ_LEN <= 8192):
     raise ValueError(f"ONNX_MAX_SEQ_LEN must be 1-8192, got {ONNX_MAX_SEQ_LEN}")
 
+# ONNX Runtime session tuning. Threads: 0 keeps the runtime's own choice (the
+# host's physical core count); set it explicitly when the process runs under a
+# CPU quota the runtime cannot see (a container limit, a shared box), where the
+# default over-subscribes the cores it was granted. Graph optimization level:
+# "all" is the runtime default; "disable" / "basic" / "extended" exist to
+# compare outputs against an un-fused graph when a result looks off.
+ONNX_INTRA_OP_THREADS = int(os.environ.get("ONNX_INTRA_OP_THREADS", "0"))
+if ONNX_INTRA_OP_THREADS < 0:
+    raise ValueError(f"ONNX_INTRA_OP_THREADS must be >= 0, got {ONNX_INTRA_OP_THREADS}")
+ONNX_GRAPH_OPT_LEVEL = os.environ.get("ONNX_GRAPH_OPT_LEVEL", "all").strip().lower()
+if ONNX_GRAPH_OPT_LEVEL not in ("disable", "basic", "extended", "all"):
+    raise ValueError(f"ONNX_GRAPH_OPT_LEVEL must be disable, basic, extended or all, got {ONNX_GRAPH_OPT_LEVEL}")
+
 # ONNX-specific — resolve relative paths against CLOTO_PROJECT_DIR when running
 # inside a sandbox (isolation changes the working directory).
 _project_dir = os.environ.get("CLOTO_PROJECT_DIR", "")
@@ -229,7 +242,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
 
     async def initialize(self) -> None:
         try:
-            import onnxruntime as ort
+            import onnxruntime  # noqa: F401  # availability check; the session is built by _create_ort_session
             from tokenizers import Tokenizer
         except ImportError:
             raise ImportError(
@@ -255,7 +268,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
 
         providers = _select_ort_providers()
 
-        self._session = ort.InferenceSession(model_path, providers=providers)
+        self._session = _create_ort_session(model_path, providers)
         self._tokenizer = Tokenizer.from_file(tokenizer_path)
         # MiniLM positional embeddings cap at 512 — clamp ONNX_MAX_SEQ_LEN.
         miniml_seq_len = min(ONNX_MAX_SEQ_LEN, 512)
@@ -348,6 +361,26 @@ def _mlx_available() -> bool:
 # ============================================================
 
 
+def _ort_session_options():
+    """Build the SessionOptions every ONNX provider creates its session with.
+
+    Kept in one place so the three ONNX providers cannot drift apart in how
+    they configure the runtime.
+    """
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    if ONNX_INTRA_OP_THREADS:
+        options.intra_op_num_threads = ONNX_INTRA_OP_THREADS
+    options.graph_optimization_level = {
+        "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+        "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+        "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+        "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+    }[ONNX_GRAPH_OPT_LEVEL]
+    return options
+
+
 def _create_ort_session(model_path: str, providers: list):
     """Create InferenceSession with CoreML-aware 3-stage fallback.
 
@@ -357,6 +390,7 @@ def _create_ort_session(model_path: str, providers: list):
     """
     import onnxruntime as ort
 
+    options = _ort_session_options()
     if "CoreMLExecutionProvider" in providers:
         rest = [p for p in providers if p != "CoreMLExecutionProvider"]
         providers_with_opts = [
@@ -371,16 +405,16 @@ def _create_ort_session(model_path: str, providers: list):
             *rest,
         ]
         try:
-            return ort.InferenceSession(model_path, providers=providers_with_opts)
+            return ort.InferenceSession(model_path, sess_options=options, providers=providers_with_opts)
         except Exception as e:
             logger.warning("CoreML init with provider_options failed, retrying without options: %s", e)
         try:
-            return ort.InferenceSession(model_path, providers=providers)
+            return ort.InferenceSession(model_path, sess_options=options, providers=providers)
         except Exception as e:
             logger.warning("CoreML plain init failed, falling back to CPU-only: %s", e)
-        return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        return ort.InferenceSession(model_path, sess_options=options, providers=["CPUExecutionProvider"])
 
-    return ort.InferenceSession(model_path, providers=providers)
+    return ort.InferenceSession(model_path, sess_options=options, providers=providers)
 
 
 # ============================================================
