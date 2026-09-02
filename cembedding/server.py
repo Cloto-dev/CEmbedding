@@ -64,6 +64,17 @@ if not (1 <= ONNX_MAX_SEQ_LEN <= 8192):
 # default over-subscribes the cores it was granted. Graph optimization level:
 # "all" is the runtime default; "disable" / "basic" / "extended" exist to
 # compare outputs against an un-fused graph when a result looks off.
+# Precision of the jina-v5-nano graph to load. fp32 is the default and the one
+# stored vectors are produced with; the other precisions of the same graph are
+# opt-in. Measured on CPU execution providers: fp16 returns identical vectors
+# and saves only download size (the runtime widens the weights to fp32); int8
+# cuts resident memory by roughly a third at a cost of 4-8x on single-query
+# latency (activations are re-quantized at run time). Pick int8 when memory is
+# the constraint and latency is not.
+EMBEDDING_MODEL_VARIANT = os.environ.get("EMBEDDING_MODEL_VARIANT", "fp32").strip().lower()
+if EMBEDDING_MODEL_VARIANT not in ("fp32", "fp16", "int8"):
+    raise ValueError(f"EMBEDDING_MODEL_VARIANT must be fp32, fp16 or int8, got {EMBEDDING_MODEL_VARIANT}")
+
 ONNX_INTRA_OP_THREADS = int(os.environ.get("ONNX_INTRA_OP_THREADS", "0"))
 if ONNX_INTRA_OP_THREADS < 0:
     raise ValueError(f"ONNX_INTRA_OP_THREADS must be >= 0, got {ONNX_INTRA_OP_THREADS}")
@@ -608,21 +619,23 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
                 "Or: uv pip install cloto-mcp-embedding[onnx]"
             )
 
-        model_path = os.path.join(self._model_dir, "model.onnx")
+        from cembedding.download_model import JINA_VARIANT_STEMS
+
+        model_path = os.path.join(self._model_dir, f"{JINA_VARIANT_STEMS[EMBEDDING_MODEL_VARIANT]}.onnx")
         tokenizer_path = os.path.join(self._model_dir, "tokenizer.json")
 
-        # Auto-download model if missing
+        # Auto-download the selected precision if missing
         if not os.path.exists(model_path) or not os.path.exists(tokenizer_path):
-            logger.info("Jina-v5-nano ONNX model not found, downloading...")
+            logger.info("Jina-v5-nano ONNX model (%s) not found, downloading...", EMBEDDING_MODEL_VARIANT)
             try:
                 from cembedding.download_model import download_jina_v5_nano
 
-                if not download_jina_v5_nano(self._model_dir):
+                if not download_jina_v5_nano(self._model_dir, variant=EMBEDDING_MODEL_VARIANT):
                     raise FileNotFoundError(f"Failed to download model to {self._model_dir}")
             except ImportError:
                 raise FileNotFoundError(
-                    f"ONNX model not found at {model_path}. "
-                    f"Download with: python -m cembedding.download_model --model jina-v5-nano"
+                    f"ONNX model not found at {model_path}. Download with: "
+                    f"python -m cembedding.download_model --model jina-v5-nano --variant {EMBEDDING_MODEL_VARIANT}"
                 )
 
         providers = _select_ort_providers()
@@ -635,8 +648,9 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         self._tokenizer.enable_truncation(max_length=ONNX_MAX_SEQ_LEN)
 
         logger.info(
-            "ONNX Jina-v5-nano provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
+            "ONNX Jina-v5-nano provider initialized (dir=%s, variant=%s, seq_len=%d, requested=%s, active=%s)",
             self._model_dir,
+            EMBEDDING_MODEL_VARIANT,
             ONNX_MAX_SEQ_LEN,
             providers,
             self._session.get_providers(),
