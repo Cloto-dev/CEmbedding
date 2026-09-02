@@ -64,6 +64,7 @@ Documentation = "https://github.com/Cloto-dev/CEmbedding#readme"
 [project.scripts]
 cembedding = "cembedding.server:run"
 cembedding-download-model = "cembedding.download_model:main"
+cembedding-sidecar = "cembedding.sidecar:main"
 
 [build-system]
 requires = ["hatchling"]
