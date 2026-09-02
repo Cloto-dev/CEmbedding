@@ -12,7 +12,6 @@ import asyncio
 import logging
 import os
 import platform as _platform
-import struct
 import sys
 from abc import ABC, abstractmethod
 
@@ -661,16 +660,131 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
 # ============================================================
 
 
+class _VectorGroup:
+    """The resident vectors of one (namespace, dimension), in a single matrix.
+
+    Rows ``[0, n)`` are in use and ``live`` says which of them still belong to
+    an item. Writes never permute rows: an overwrite rewrites the item's own
+    row, an append takes the next free row, and a removal only clears the
+    liveness flag. That matters beyond speed — search breaks score ties by row
+    order, so keeping positions stable keeps results stable. Tombstoned rows
+    are reclaimed by ``maybe_compact`` once they outnumber the live ones, which
+    bounds the wasted memory at half the matrix while still preserving the
+    relative order of everything that survives.
+    """
+
+    __slots__ = ("dim", "matrix", "ids", "rows", "live", "n", "dead", "_backend_matrix", "_dirty")
+
+    #: Smallest matrix allocation; below this the doubling is not worth the copies.
+    MIN_CAPACITY = 64
+
+    def __init__(self, dim: int, capacity: int = 0):
+        self.dim = dim
+        self.matrix = np.zeros((max(capacity, self.MIN_CAPACITY), dim), dtype=np.float32)
+        self.ids: list[str] = []
+        self.rows: dict[str, int] = {}
+        self.live = np.zeros(self.matrix.shape[0], dtype=bool)
+        self.n = 0
+        self.dead = 0
+        # Resident copy for a non-numpy backend, rebuilt lazily after writes.
+        self._backend_matrix = None
+        self._dirty = True
+
+    @property
+    def capacity(self) -> int:
+        return self.matrix.shape[0]
+
+    def put(self, item_id: str, vec: np.ndarray) -> None:
+        """Insert a vector, or overwrite an existing id in place at its own row."""
+        row = self.rows.get(item_id)
+        if row is None:
+            if self.n == self.capacity:
+                self._grow()
+            row = self.n
+            self.n += 1
+            self.ids.append(item_id)
+            self.rows[item_id] = row
+            self.live[row] = True
+        self.matrix[row] = vec
+        self._dirty = True
+
+    def tombstone(self, item_id: str) -> bool:
+        """Mark an id's row dead. Returns False when the id is not in this group."""
+        row = self.rows.pop(item_id, None)
+        if row is None:
+            return False
+        self.live[row] = False
+        self.dead += 1
+        self._dirty = True
+        return True
+
+    def _grow(self) -> None:
+        """Double the allocation, so appending N items costs O(N) copies overall."""
+        capacity = max(self.MIN_CAPACITY, self.capacity * 2)
+        matrix = np.zeros((capacity, self.dim), dtype=np.float32)
+        matrix[: self.n] = self.matrix[: self.n]
+        live = np.zeros(capacity, dtype=bool)
+        live[: self.n] = self.live[: self.n]
+        self.matrix = matrix
+        self.live = live
+
+    def maybe_compact(self) -> None:
+        """Reclaim tombstoned rows once they outnumber the live ones.
+
+        Live rows keep their relative order, so search results and tie order are
+        unaffected. The allocation itself is kept for the next appends.
+        """
+        if self.dead == 0 or self.dead <= self.n // 2:
+            return
+        keep = np.nonzero(self.live[: self.n])[0]
+        self.matrix[: keep.size] = self.matrix[keep]
+        self.live[: keep.size] = True
+        self.live[keep.size : self.n] = False
+        self.ids = [self.ids[row] for row in keep]
+        self.rows = {item_id: row for row, item_id in enumerate(self.ids)}
+        self.n = int(keep.size)
+        self.dead = 0
+        self._dirty = True
+
+    def load(self, ids: list[str], block: np.ndarray) -> None:
+        """Fill an empty group from one contiguous block of rows (startup path)."""
+        if block.shape[0]:
+            self.matrix[: block.shape[0]] = block
+        self.ids = list(ids)
+        self.rows = {item_id: row for row, item_id in enumerate(self.ids)}
+        self.live[: len(self.ids)] = True
+        self.n = len(self.ids)
+        self.dead = 0
+        self._dirty = True
+
+    def operand(self):
+        """Return the used rows in the form the search backend multiplies."""
+        used = self.matrix[: self.n]
+        if EMBEDDING_SEARCH_BACKEND != "mlx":
+            return used
+        # The numpy matrix stays the source of truth; the backend copy is
+        # rebuilt only when a write since the last search invalidated it.
+        if self._dirty or self._backend_matrix is None:
+            self._backend_matrix = VectorIndex._to_backend(used)
+            self._dirty = False
+        return self._backend_matrix
+
+
 class VectorIndex:
     """Persistent vector index with in-memory search.
 
-    Stores vectors in SQLite for durability, loads into memory for fast
-    brute-force dot product search. Namespaced to support multiple consumers.
+    Vectors are stored in SQLite for durability and held in memory as one
+    float32 matrix per (namespace, dimension); a query is a single matmul over
+    that matrix instead of a per-item Python loop, which used to dominate
+    wall-clock from a few thousand vectors up.
 
-    v0.5.0: search runs on a per-namespace contiguous matrix (one matmul per
-    query) instead of a per-item Python loop — the loop dominated wall-clock
-    from a few thousand vectors up (~1.6 s/query at 237k x 384). The matrix is
-    built lazily on first search and invalidated by index/remove/purge.
+    There is exactly one resident copy of every vector. An earlier layout kept
+    two — a per-item ndarray map plus a stacked search matrix rebuilt lazily —
+    which doubled resident memory and made every write O(N), because the write
+    discarded the stack and the next search re-stacked the whole namespace.
+    Now an append is amortised O(1) into spare capacity, an overwrite touches
+    one row, a removal flips one flag, and no write rebuilds the matrix.
+
     ``EMBEDDING_SEARCH_BACKEND=mlx`` opts into Apple-GPU matmul (falls back to
     numpy when mlx is unavailable); numpy (Accelerate BLAS) is the default.
     """
@@ -678,12 +792,8 @@ class VectorIndex:
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._db = None
-        # In-memory index: {namespace: {item_id: np.array(float32)}}
-        self._index: dict[str, dict[str, np.ndarray]] = {}
-        # Search-matrix cache: {namespace: {dim: (matrix N x dim, [item_id, ...])}}.
-        # Rows keep self._index insertion order so scores/ties match the
-        # per-item loop this replaced. Invalidated (popped) on any write.
-        self._matrix_cache: dict[str, dict[int, tuple[np.ndarray, list[str]]]] = {}
+        # Resident vectors: {namespace: {dimension: _VectorGroup}}
+        self._groups: dict[str, dict[int, _VectorGroup]] = {}
 
     async def initialize(self) -> None:
         import aiosqlite
@@ -709,43 +819,88 @@ class VectorIndex:
         )
         await self._db.commit()
 
-        # Load all vectors into memory
+        # Load all vectors into memory. Blobs are collected per group first and
+        # decoded in one pass per group: decoding them one by one would allocate
+        # an array object per vector only to copy it into the matrix and drop it.
         rows = await self._db.execute_fetchall("SELECT namespace, item_id, vector FROM vectors")
+        grouped: dict[tuple[str, int], tuple[list[str], list[bytes]]] = {}
         for ns, item_id, blob in rows:
-            if ns not in self._index:
-                self._index[ns] = {}
-            self._index[ns][item_id] = np.frombuffer(blob, dtype=np.float32).copy()
+            if len(blob) % 4:
+                raise ValueError(f"vector blob for {ns}/{item_id} is not a whole number of float32 values")
+            entry = grouped.get((ns, len(blob)))
+            if entry is None:
+                entry = grouped[(ns, len(blob))] = ([], [])
+            entry[0].append(item_id)
+            entry[1].append(blob)
 
-        total = sum(len(v) for v in self._index.values())
-        logger.info("VectorIndex loaded: %d vectors across %d namespaces", total, len(self._index))
+        total = 0
+        for (ns, byte_len), (ids, blobs) in grouped.items():
+            dim = byte_len // 4
+            group = _VectorGroup(dim, capacity=len(ids))
+            # A zero-dimension blob carries no coordinates, so there is nothing
+            # to decode; the ids are still tracked so counts stay accurate.
+            block = (
+                np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(-1, dim)
+                if dim
+                else np.zeros((0, 0), dtype=np.float32)
+            )
+            group.load(ids, block)
+            self._groups.setdefault(ns, {})[dim] = group
+            total += group.n
+
+        logger.info("VectorIndex loaded: %d vectors across %d namespaces", total, len(self._groups))
 
     async def index(self, namespace: str, items: list[dict], provider: "EmbeddingProvider") -> int:
         """Index items. Each item has 'id' and 'text'. Returns count indexed."""
         if not self._db:
             raise RuntimeError("VectorIndex not initialized")
+        if not items:
+            return 0
 
         texts = [item["text"] for item in items]
         embeddings = await provider.embed(texts)
+        if not embeddings:
+            return 0
 
-        self._matrix_cache.pop(namespace, None)
-        if namespace not in self._index:
-            self._index[namespace] = {}
+        # One conversion for the whole batch: the per-item vectors below are
+        # views into it, so a batch of B vectors allocates one array, not B.
+        batch = np.asarray(embeddings, dtype=np.float32)
+        if batch.ndim != 2:
+            raise ValueError(f"provider returned {batch.ndim}-D embeddings, expected one vector per text")
 
+        ns_groups = self._groups.setdefault(namespace, {})
+        params = []
         indexed = 0
-        for item, emb in zip(items, embeddings):
+        for item, vec in zip(items, batch):
             item_id = item["id"]
-            vec = np.array(emb, dtype=np.float32)
-            blob = struct.pack(f"<{len(vec)}f", *vec)
-
-            await self._db.execute(
-                "INSERT OR REPLACE INTO vectors (namespace, item_id, vector) VALUES (?, ?, ?)",
-                (namespace, item_id, blob),
-            )
-            self._index[namespace][item_id] = vec
+            # Native float32 bytes, i.e. the little-endian layout the loader reads back.
+            params.append((namespace, item_id, vec.astype(np.float32, copy=False).tobytes()))
+            self._put(ns_groups, item_id, vec)
             indexed += 1
 
+        # One statement for the batch: a per-row execute paid a round trip and a
+        # statement reset for every vector.
+        await self._db.executemany(
+            "INSERT OR REPLACE INTO vectors (namespace, item_id, vector) VALUES (?, ?, ?)",
+            params,
+        )
         await self._db.commit()
         return indexed
+
+    def _put(self, ns_groups: dict[int, _VectorGroup], item_id: str, vec: np.ndarray) -> None:
+        """Store one vector in its dimension's group, moving it if the dimension changed."""
+        dim = int(vec.shape[0])
+        group = ns_groups.get(dim)
+        if group is None:
+            group = ns_groups[dim] = _VectorGroup(dim)
+        if item_id not in group.rows:
+            # An id may hold only one vector, so a re-index at a new dimension
+            # has to retire the row it occupies in the old dimension's group.
+            for other_dim, other in ns_groups.items():
+                if other_dim != dim and other.tombstone(item_id):
+                    other.maybe_compact()
+                    break
+        group.put(item_id, vec)
 
     async def search(
         self,
@@ -756,67 +911,43 @@ class VectorIndex:
         provider: "EmbeddingProvider",
     ) -> list[dict]:
         """Search for similar vectors. Returns [{id, score}, ...] sorted by score desc."""
-        ns_index = self._index.get(namespace)
-        if not ns_index:
+        ns_groups = self._groups.get(namespace)
+        if not ns_groups or not any(group.rows for group in ns_groups.values()):
             return []
 
         embeddings = await provider.embed([query])
         if not embeddings or not embeddings[0]:
             return []
 
-        query_vec = np.array(embeddings[0], dtype=np.float32)
-        query_dim = len(query_vec)
-
-        matrix, ids = self._get_search_matrix(namespace, query_dim)
-        if matrix is None:
+        query_vec = np.asarray(embeddings[0], dtype=np.float32)
+        # Vectors of another dimension are not comparable and are skipped, the
+        # same exclusion the per-item loop made with a length check.
+        group = ns_groups.get(int(query_vec.shape[0]))
+        if group is None or group.n == 0:
             return []
-        sims = self._matmul(matrix, query_vec)
+        sims = self._matmul(group.operand(), query_vec)
 
-        # Vectorized threshold + top-K. A stable descending sort keeps
-        # insertion order among equal scores — the same tie behavior as the
-        # heapq.nlargest over an insertion-ordered candidate list it replaced.
-        hits = np.nonzero(sims >= min_similarity)[0]
+        # Vectorized threshold + top-K. Tombstoned rows still take part in the
+        # matmul (skipping them would cost a copy of the matrix) and are dropped
+        # here. A stable descending sort keeps row order among equal scores —
+        # the same tie behavior as the heapq.nlargest over an insertion-ordered
+        # candidate list it replaced.
+        hits = np.nonzero((sims >= min_similarity) & group.live[: group.n])[0]
         if limit <= 0 or hits.size == 0:
             return []
         if hits.size > limit:
             hits = hits[np.argpartition(sims[hits], -limit)[-limit:]]
-            hits.sort()  # restore insertion order so the stable sort's tie order matches
+            hits.sort()  # restore row order so the stable sort's tie order matches
         order = hits[np.argsort(-sims[hits], kind="stable")]
+        ids = group.ids
         return [{"id": ids[i], "score": round(float(sims[i]), 4)} for i in order]
-
-    def _get_search_matrix(self, namespace: str, dim: int) -> tuple[object, list[str]]:
-        """Return the cached (matrix, ids) for a namespace+dimension, building lazily.
-
-        Rows follow self._index insertion order, so candidate order (and
-        therefore heapq tie behavior) matches the per-item loop this replaced.
-        Vectors of other dimensions are excluded, like the loop's len() skip.
-        """
-        groups = self._matrix_cache.get(namespace)
-        if groups is None:
-            ns_index = self._index.get(namespace)
-            if not ns_index:
-                return None, []
-            by_dim: dict[int, tuple[list[np.ndarray], list[str]]] = {}
-            for item_id, vec in ns_index.items():
-                vecs, ids = by_dim.setdefault(len(vec), ([], []))
-                vecs.append(vec)
-                ids.append(item_id)
-            groups = {
-                d: (self._to_backend(np.ascontiguousarray(np.stack(vecs), dtype=np.float32)), ids)
-                for d, (vecs, ids) in by_dim.items()
-            }
-            self._matrix_cache[namespace] = groups
-        entry = groups.get(dim)
-        if entry is None:
-            return None, []
-        return entry
 
     @staticmethod
     def _to_backend(matrix: np.ndarray):
-        """Convert a freshly built matrix to the search backend's resident form.
+        """Convert a matrix to the search backend's resident form.
 
-        mlx arrays live in unified memory, so converting once at cache-build
-        time (not per query) is what makes the GPU path pay off.
+        mlx arrays live in unified memory, so converting when the matrix changes
+        (not per query) is what makes the GPU path pay off.
         """
         if EMBEDDING_SEARCH_BACKEND == "mlx":
             try:
@@ -840,20 +971,30 @@ class VectorIndex:
         """Remove items from index. Returns count removed."""
         if not self._db:
             raise RuntimeError("VectorIndex not initialized")
+        if not ids:
+            return 0
 
-        removed = 0
-        self._matrix_cache.pop(namespace, None)
-        ns_index = self._index.get(namespace, {})
+        ns_groups = self._groups.get(namespace, {})
         for item_id in ids:
-            cursor = await self._db.execute(
-                "DELETE FROM vectors WHERE namespace = ? AND item_id = ?",
-                (namespace, item_id),
-            )
-            if cursor.rowcount > 0:
-                removed += 1
-            ns_index.pop(item_id, None)
+            for group in ns_groups.values():
+                if group.tombstone(item_id):
+                    break
 
+        cursor = await self._db.executemany(
+            "DELETE FROM vectors WHERE namespace = ? AND item_id = ?",
+            [(namespace, item_id) for item_id in ids],
+        )
+        # executemany reports the rows deleted by the whole batch. With
+        # (namespace, item_id) as the primary key each id deletes at most one
+        # row, so this equals the number of ids that existed — the same figure
+        # the per-id loop counted, including a repeated id counting once.
+        removed = cursor.rowcount
         await self._db.commit()
+
+        for dim in [dim for dim, group in ns_groups.items() if not group.rows]:
+            del ns_groups[dim]
+        for group in ns_groups.values():
+            group.maybe_compact()
         return removed
 
     async def purge_namespace(self, namespace: str) -> int:
@@ -863,20 +1004,18 @@ class VectorIndex:
 
         cursor = await self._db.execute("DELETE FROM vectors WHERE namespace = ?", (namespace,))
         await self._db.commit()
-        self._matrix_cache.pop(namespace, None)
-        removed = len(self._index.pop(namespace, {}))
+        removed = sum(len(group.rows) for group in self._groups.pop(namespace, {}).values())
         return max(cursor.rowcount, removed)
 
     async def count(self, namespace: str) -> int:
         """Count vectors in a namespace."""
-        return len(self._index.get(namespace, {}))
+        return sum(len(group.rows) for group in self._groups.get(namespace, {}).values())
 
     async def shutdown(self) -> None:
         if self._db:
             await self._db.close()
             self._db = None
-        self._index.clear()
-        self._matrix_cache.clear()
+        self._groups.clear()
 
 
 _vector_index: VectorIndex | None = None
