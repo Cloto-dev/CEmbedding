@@ -113,6 +113,7 @@ Vectors already indexed with one precision stay usable with another (the mixed-p
 | `EMBEDDING_MODEL_VARIANT` | `fp32` | Precision of jina-v5-nano to load: `fp32` / `fp16` / `int8` (downloaded on first use). See [Model precision](#model-precision) before changing it |
 | `ONNX_INTRA_OP_THREADS` | `0` | ONNX Runtime intra-op threads. `0` = runtime default (physical cores). Set it when the process runs under a CPU quota the runtime cannot see (container limit, shared host) |
 | `ONNX_GRAPH_OPT_LEVEL` | `all` | ONNX Runtime graph optimization: `disable` / `basic` / `extended` / `all`. Lower it only to compare against an un-fused graph |
+| `EMBEDDING_MAX_BATCH` | `64` | Most texts one model run may carry when concurrent requests are merged into it. Local providers run one pass at a time, so requests that arrive while a pass is in flight share the next one instead of each paying for a pass (nothing waits for a batch to fill, and one request is never split). Results are bit-identical on the CPU provider; on accelerator providers the low bits (about 1e-6) can depend on the batch a text ran in, as they already did for multi-text requests. `0` disables merging |
 | `EMBEDDING_API_KEY` | — | Required for `api_openai` |
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
 | `CEMBEDDING_AUTH_TOKEN` | — | Inbound bearer token. Unset = no authentication (see below) |
