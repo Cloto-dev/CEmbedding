@@ -82,6 +82,22 @@ Set `EMBEDDING_PROVIDER`:
 
 Download a local model with `cembedding-download-model --model {miniml,jina-v5-nano,bge-m3}` (or `python -m cembedding.download_model ...` from a source checkout; fetched from HuggingFace into `./data/models`, not committed to this repo).
 
+## Model precision
+
+The jina-v5-nano repository ships the same graph in several precisions. `EMBEDDING_MODEL_VARIANT` selects one; `cembedding-download-model --model jina-v5-nano --variant <v>` fetches it ahead of time. Measured on CPU execution providers with a mixed English/Japanese corpus (55 texts, 22 queries), against the fp32 vectors as reference:
+
+| variant | download | resident (laptop) | single query (laptop / 4-core x86) | cosine to fp32, median / worst | top-10 agreement |
+|---|---:|---:|---:|---|---:|
+| `fp32` (default) | 810 MB | 906 MB | 5.8 ms / 71 ms | — | — |
+| `fp16` | 405 MB | 933 MB | 6.3 ms / — | 1.0000 / 1.0000 | 1.00 |
+| `int8` | 236 MB | 628 MB | 46 ms / 319 ms | 0.9998 / 0.9981 | 0.97 |
+
+- `fp16` produces the same vectors as `fp32`. It halves the download and nothing else: CPU execution providers widen the weights back to fp32 at load.
+- `int8` cuts resident memory by about a third and keeps retrieval quality (top-10 agreement 0.97 against fp32, 0.98 when int8 queries run against an fp32-indexed corpus), but single-query latency is 4-8x worse on every CPU measured, because activations are quantized at run time. Choose it when memory is the constraint and latency is not.
+- The 4-bit variants in the same repository are not offered: on this corpus their worst-case cosine to fp32 was 0.30.
+
+Vectors already indexed with one precision stay usable with another (the mixed-precision agreement above), so switching does not require re-indexing, though re-indexing removes the residual difference.
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -98,8 +114,10 @@ Download a local model with `cembedding-download-model --model {miniml,jina-v5-n
 | `ONNX_MODEL_DIR` | (auto) | Override the model directory for ONNX providers |
 | `ONNX_EP_PREFERENCE` | (auto) | ONNX execution providers, comma-separated. Empty = auto (CoreML on macOS, DirectML on Windows, else CPU; CPU always ensured) |
 | `ONNX_MAX_SEQ_LEN` | `2048` | Max tokenization length (1–8192; MiniLM clamped to 512 internally) |
+| `EMBEDDING_MODEL_VARIANT` | `fp32` | Precision of jina-v5-nano to load: `fp32` / `fp16` / `int8` (downloaded on first use). See [Model precision](#model-precision) before changing it |
 | `ONNX_INTRA_OP_THREADS` | `0` | ONNX Runtime intra-op threads. `0` = runtime default (physical cores). Set it when the process runs under a CPU quota the runtime cannot see (container limit, shared host) |
 | `ONNX_GRAPH_OPT_LEVEL` | `all` | ONNX Runtime graph optimization: `disable` / `basic` / `extended` / `all`. Lower it only to compare against an un-fused graph |
+| `EMBEDDING_MAX_BATCH` | `64` | Most texts one model run may carry when concurrent requests are merged into it. Local providers run one pass at a time, so requests that arrive while a pass is in flight share the next one instead of each paying for a pass (nothing waits for a batch to fill, and one request is never split). Results are bit-identical on the CPU provider; on accelerator providers the low bits (about 1e-6) can depend on the batch a text ran in, as they already did for multi-text requests. `0` disables merging |
 | `EMBEDDING_API_KEY` | — | Required for `api_openai` |
 | `EMBEDDING_API_URL` | `https://api.openai.com/v1/embeddings` | API endpoint for `api_openai` |
 | `CEMBEDDING_AUTH_TOKEN` | — | Inbound bearer token. Unset = no authentication (see below) |

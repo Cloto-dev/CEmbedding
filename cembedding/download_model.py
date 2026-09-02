@@ -54,13 +54,32 @@ MINIML_FILES = {
     "tokenizer.json": "tokenizer.json",
 }
 
-# jina-v5-nano (retrieval variant with merged LoRA, external data format)
+# jina-v5-nano (retrieval variant with merged LoRA, external data format).
+# The repository ships several precisions of the same graph. Each .onnx names
+# its external-data file inside the protobuf, so the pair keeps the upstream
+# stem on disk; the fp32 pair keeps the historical names "model.onnx" /
+# "model.onnx_data" so an existing download stays valid.
 JINA_REPO = "jinaai/jina-embeddings-v5-text-nano-retrieval"
-JINA_FILES = {
-    "model.onnx": "onnx/model.onnx",
-    "model.onnx_data": "onnx/model.onnx_data",
-    "tokenizer.json": "tokenizer.json",
+JINA_VARIANT_STEMS = {
+    "fp32": "model",
+    "fp16": "model_fp16",
+    "int8": "model_quantized",
 }
+
+
+def jina_v5_nano_files(variant: str = "fp32") -> dict[str, str]:
+    """local filename -> repo path for one precision of jina-v5-nano."""
+    if variant not in JINA_VARIANT_STEMS:
+        raise ValueError(f"unknown jina-v5-nano variant {variant!r}; expected one of {sorted(JINA_VARIANT_STEMS)}")
+    stem = JINA_VARIANT_STEMS[variant]
+    return {
+        f"{stem}.onnx": f"onnx/{stem}.onnx",
+        f"{stem}.onnx_data": f"onnx/{stem}.onnx_data",
+        "tokenizer.json": "tokenizer.json",
+    }
+
+
+JINA_FILES = jina_v5_nano_files("fp32")
 
 # bge-m3 (Xenova int8 single-file, ~542MB)
 # Xenova/bge-m3 is the canonical Transformers.js ONNX conversion maintained by HuggingFace
@@ -91,12 +110,12 @@ def download():
     return ok
 
 
-def download_jina_v5_nano(model_dir: str = "") -> bool:
-    """Download jina-embeddings-v5-text-nano-retrieval ONNX model."""
+def download_jina_v5_nano(model_dir: str = "", variant: str = "fp32") -> bool:
+    """Download jina-embeddings-v5-text-nano-retrieval ONNX model (one precision)."""
     if not model_dir:
         model_dir = os.environ.get("ONNX_MODEL_DIR", "data/models/jina-embeddings-v5-text-nano")
-    print("=== Downloading jina-embeddings-v5-text-nano-retrieval ===")
-    ok = _download_repo_files(JINA_REPO, JINA_FILES, model_dir)
+    print(f"=== Downloading jina-embeddings-v5-text-nano-retrieval ({variant}) ===")
+    ok = _download_repo_files(JINA_REPO, jina_v5_nano_files(variant), model_dir)
     if ok:
         print(f"Model ready at {model_dir}")
     return ok
@@ -117,12 +136,19 @@ def main():
     """Console-script / ``python -m cembedding.download_model`` entry point."""
     parser = argparse.ArgumentParser(description="Download ONNX embedding models")
     parser.add_argument("--model", default="miniml", choices=["miniml", "jina-v5-nano", "bge-m3"])
+    parser.add_argument(
+        "--variant",
+        default="fp32",
+        choices=sorted(JINA_VARIANT_STEMS),
+        help="precision of jina-v5-nano to fetch (ignored for other models); the server "
+        "selects it at runtime with EMBEDDING_MODEL_VARIANT",
+    )
     args = parser.parse_args()
 
     if args.model == "miniml":
         success = download()
     elif args.model == "jina-v5-nano":
-        success = download_jina_v5_nano()
+        success = download_jina_v5_nano(variant=args.variant)
     else:
         success = download_bge_m3()
     sys.exit(0 if success else 1)

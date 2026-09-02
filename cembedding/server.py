@@ -14,6 +14,7 @@ import os
 import platform as _platform
 import sys
 from abc import ABC, abstractmethod
+from collections import deque
 
 import httpx
 import numpy as np
@@ -65,12 +66,37 @@ if not (1 <= ONNX_MAX_SEQ_LEN <= 8192):
 # default over-subscribes the cores it was granted. Graph optimization level:
 # "all" is the runtime default; "disable" / "basic" / "extended" exist to
 # compare outputs against an un-fused graph when a result looks off.
+# Precision of the jina-v5-nano graph to load. fp32 is the default and the one
+# stored vectors are produced with; the other precisions of the same graph are
+# opt-in. Measured on CPU execution providers: fp16 returns identical vectors
+# and saves only download size (the runtime widens the weights to fp32); int8
+# cuts resident memory by roughly a third at a cost of 4-8x on single-query
+# latency (activations are re-quantized at run time). Pick int8 when memory is
+# the constraint and latency is not.
+EMBEDDING_MODEL_VARIANT = os.environ.get("EMBEDDING_MODEL_VARIANT", "fp32").strip().lower()
+if EMBEDDING_MODEL_VARIANT not in ("fp32", "fp16", "int8"):
+    raise ValueError(f"EMBEDDING_MODEL_VARIANT must be fp32, fp16 or int8, got {EMBEDDING_MODEL_VARIANT}")
+
 ONNX_INTRA_OP_THREADS = int(os.environ.get("ONNX_INTRA_OP_THREADS", "0"))
 if ONNX_INTRA_OP_THREADS < 0:
     raise ValueError(f"ONNX_INTRA_OP_THREADS must be >= 0, got {ONNX_INTRA_OP_THREADS}")
 ONNX_GRAPH_OPT_LEVEL = os.environ.get("ONNX_GRAPH_OPT_LEVEL", "all").strip().lower()
 if ONNX_GRAPH_OPT_LEVEL not in ("disable", "basic", "extended", "all"):
     raise ValueError(f"ONNX_GRAPH_OPT_LEVEL must be disable, basic, extended or all, got {ONNX_GRAPH_OPT_LEVEL}")
+
+# Largest merged run the local providers may build out of concurrent requests.
+# A local model holds one session that runs one forward pass at a time, and a
+# batched pass costs far less per text than the same texts one pass at a time
+# (32 texts in one pass took 88 ms against 234 ms serially), so requests that
+# arrive while a pass is in flight are merged into the next one. Nothing waits
+# for a batch to fill, so a request that arrives idle is unaffected; this only
+# caps how many texts one merged pass may carry, trading its latency (the
+# whole batch finishes together) against throughput. A single request is never
+# split, so a request larger than the cap still runs in one pass. 0 turns
+# merging off: every request gets a pass of its own, as before.
+EMBEDDING_MAX_BATCH = int(os.environ.get("EMBEDDING_MAX_BATCH", "64"))
+if EMBEDDING_MAX_BATCH < 0:
+    raise ValueError(f"EMBEDDING_MAX_BATCH must be >= 0, got {EMBEDDING_MAX_BATCH}")
 
 # ONNX-specific — resolve relative paths against CLOTO_PROJECT_DIR when running
 # inside a sandbox (isolation changes the working directory).
@@ -134,6 +160,96 @@ def _select_ort_providers() -> list:
         providers.append("CPUExecutionProvider")
 
     return providers
+
+
+# ============================================================
+# Request coalescing (shared by the local-model providers)
+# ============================================================
+
+
+class _BatchRunner:
+    """Merges concurrent embedding requests into one model run.
+
+    A local model provider owns a single session, so the runs have to be
+    serialized no matter what; the question is only whether waiting requests
+    each pay for a run of their own. Since a run costs far less per text in a
+    batch than alone, this queues the waiting requests and gives the next run
+    all of them at once.
+
+    "Batch while busy", with no timer: a request that finds the runner idle
+    starts its run immediately, so a lone caller sees exactly the latency it
+    saw before. Requests that arrive while a run is in flight accumulate and
+    share the next one. The batch is capped at ``max_batch`` texts, except
+    that the first request of a run is always taken whole — splitting one
+    caller's texts across runs would buy nothing and would break the promise
+    that a batch is embedded together. ``max_batch=0`` means every request
+    gets its own run.
+
+    ``run`` is called only from the drain loop, and at most one drain loop
+    exists at a time, which is what serializes access to the session (this
+    replaced a per-provider ``asyncio.Lock``).
+    """
+
+    def __init__(self, run, max_batch: int):
+        #: ``callable(list[str]) -> list[list[float]]``, run in the default executor.
+        self._run = run
+        self._max_batch = max_batch
+        self._queue: deque[tuple[list[str], asyncio.Future]] = deque()
+        self._drain_task: asyncio.Task | None = None
+
+    async def submit(self, texts: list[str]) -> list[list[float]]:
+        """Embed ``texts``, possibly inside a run shared with other callers."""
+        # A request with no texts has no work to do. Answering it here keeps
+        # the answer from depending on whether it happened to be merged with a
+        # non-empty request.
+        if not texts:
+            return []
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._queue.append((texts, future))
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = loop.create_task(self._drain())
+        return await future
+
+    def _take_batch(self) -> tuple[list[str], list[tuple[asyncio.Future, int]]]:
+        """Pop as many queued requests as one run may carry."""
+        batch: list[str] = []
+        waiters: list[tuple[asyncio.Future, int]] = []
+        while self._queue:
+            texts, future = self._queue[0]
+            if future.cancelled():  # caller gave up (disconnect, timeout)
+                self._queue.popleft()
+                continue
+            if waiters and (self._max_batch == 0 or len(batch) + len(texts) > self._max_batch):
+                break
+            self._queue.popleft()
+            batch.extend(texts)
+            waiters.append((future, len(texts)))
+        return batch, waiters
+
+    async def _drain(self) -> None:
+        loop = asyncio.get_running_loop()
+        while self._queue:
+            batch, waiters = self._take_batch()
+            if not waiters:  # everything queued had been cancelled
+                continue
+            try:
+                rows = await loop.run_in_executor(None, self._run, batch)
+            except Exception as exc:
+                # The whole run failed, so every caller in it fails — but the
+                # loop keeps going, or one bad request would strand every
+                # request queued behind it.
+                for future, _ in waiters:
+                    if not future.done():
+                        future.set_exception(exc)
+                continue
+            # Rows come back in the order the texts went in, so each caller
+            # takes the slice its own texts occupy.
+            start = 0
+            for future, count in waiters:
+                if not future.done():
+                    future.set_result(rows[start : start + count])
+                start += count
 
 
 # ============================================================
@@ -239,7 +355,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
         self._model_dir = model_dir
         self._session = None
         self._tokenizer = None
-        self._lock = asyncio.Lock()
+        self._runner = _BatchRunner(self._embed_sync, EMBEDDING_MAX_BATCH)
 
     async def initialize(self) -> None:
         try:
@@ -297,8 +413,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
         if not self._session or not self._tokenizer:
             raise RuntimeError("Provider not initialized")
 
-        async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(None, self._embed_sync, texts)
+        return await self._runner.submit(texts)
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         """Synchronous embedding (run in executor to avoid blocking)."""
@@ -437,7 +552,7 @@ class MlxBgeM3Provider(EmbeddingProvider):
         self._model_path = model_path
         self._model = None
         self._tokenizer = None
-        self._lock = asyncio.Lock()
+        self._runner = _BatchRunner(self._embed_sync, EMBEDDING_MAX_BATCH)
 
     async def initialize(self) -> None:
         try:
@@ -452,8 +567,7 @@ class MlxBgeM3Provider(EmbeddingProvider):
         if not self._model or not self._tokenizer:
             raise RuntimeError("Provider not initialized")
 
-        async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(None, self._embed_sync, texts)
+        return await self._runner.submit(texts)
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         import mlx.core as mx
@@ -497,7 +611,7 @@ class OnnxBgeM3Provider(EmbeddingProvider):
         self._model_dir = model_dir
         self._session = None
         self._tokenizer = None
-        self._lock = asyncio.Lock()
+        self._runner = _BatchRunner(self._embed_sync, EMBEDDING_MAX_BATCH)
 
     async def initialize(self) -> None:
         try:
@@ -545,8 +659,7 @@ class OnnxBgeM3Provider(EmbeddingProvider):
         if not self._session or not self._tokenizer:
             raise RuntimeError("Provider not initialized")
 
-        async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(None, self._embed_sync, texts)
+        return await self._runner.submit(texts)
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         """Synchronous embedding with CLS-token pooling."""
@@ -597,7 +710,7 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         self._model_dir = model_dir
         self._session = None
         self._tokenizer = None
-        self._lock = asyncio.Lock()
+        self._runner = _BatchRunner(self._embed_sync, EMBEDDING_MAX_BATCH)
 
     async def initialize(self) -> None:
         try:
@@ -609,21 +722,23 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
                 "Or: uv pip install cloto-mcp-embedding[onnx]"
             )
 
-        model_path = os.path.join(self._model_dir, "model.onnx")
+        from cembedding.download_model import JINA_VARIANT_STEMS
+
+        model_path = os.path.join(self._model_dir, f"{JINA_VARIANT_STEMS[EMBEDDING_MODEL_VARIANT]}.onnx")
         tokenizer_path = os.path.join(self._model_dir, "tokenizer.json")
 
-        # Auto-download model if missing
+        # Auto-download the selected precision if missing
         if not os.path.exists(model_path) or not os.path.exists(tokenizer_path):
-            logger.info("Jina-v5-nano ONNX model not found, downloading...")
+            logger.info("Jina-v5-nano ONNX model (%s) not found, downloading...", EMBEDDING_MODEL_VARIANT)
             try:
                 from cembedding.download_model import download_jina_v5_nano
 
-                if not download_jina_v5_nano(self._model_dir):
+                if not download_jina_v5_nano(self._model_dir, variant=EMBEDDING_MODEL_VARIANT):
                     raise FileNotFoundError(f"Failed to download model to {self._model_dir}")
             except ImportError:
                 raise FileNotFoundError(
-                    f"ONNX model not found at {model_path}. "
-                    f"Download with: python -m cembedding.download_model --model jina-v5-nano"
+                    f"ONNX model not found at {model_path}. Download with: "
+                    f"python -m cembedding.download_model --model jina-v5-nano --variant {EMBEDDING_MODEL_VARIANT}"
                 )
 
         providers = _select_ort_providers()
@@ -636,8 +751,9 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         self._tokenizer.enable_truncation(max_length=ONNX_MAX_SEQ_LEN)
 
         logger.info(
-            "ONNX Jina-v5-nano provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
+            "ONNX Jina-v5-nano provider initialized (dir=%s, variant=%s, seq_len=%d, requested=%s, active=%s)",
             self._model_dir,
+            EMBEDDING_MODEL_VARIANT,
             ONNX_MAX_SEQ_LEN,
             providers,
             self._session.get_providers(),
@@ -650,8 +766,7 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         if not self._session or not self._tokenizer:
             raise RuntimeError("Provider not initialized")
 
-        async with self._lock:
-            return await asyncio.get_event_loop().run_in_executor(None, self._embed_sync, texts)
+        return await self._runner.submit(texts)
 
     def _embed_sync(self, texts: list[str]) -> list[list[float]]:
         """Synchronous embedding with Last-Token pooling."""
