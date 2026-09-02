@@ -7,7 +7,7 @@
   "version": "0.7.0",
   "category": "tool",
   "trust_level": "core",
-  "magic_seal": "sha256:73e38571d736e44e30c1035f7ac74b11e82a8f2c6bab732ebe77ba2cdc6da3c1",
+  "magic_seal": "sha256:f75b48b630e7b1cf539577121ffddede7e35a72aadc92733d064359145ff5e64",
   "install": {
     "source": {
       "type": "git",
