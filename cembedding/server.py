@@ -15,6 +15,7 @@ import platform as _platform
 import sys
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Mapping
 
 import httpx
 import numpy as np
@@ -40,6 +41,28 @@ EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "api_openai")
 EMBEDDING_HTTP_PORT = int(os.environ.get("EMBEDDING_HTTP_PORT", "8401"))
 if not (1 <= EMBEDDING_HTTP_PORT <= 65535):
     raise ValueError(f"EMBEDDING_HTTP_PORT must be 1-65535, got {EMBEDDING_HTTP_PORT}")
+HTTP_HOST_ENV = "EMBEDDING_HTTP_HOST"
+
+
+def resolve_http_host(env: Mapping[str, str] | None = None) -> str:
+    """Read the address the REST endpoint binds. Whitespace-only means unset.
+
+    Loopback is the default because that is what a single-host install wants.
+    It is wrong for a container, where loopback is the container's own: a
+    published port then forwards to a socket nothing is listening on, and the
+    connection is refused in a way that reads like a crash.
+
+    Moving this address decides nothing about who is served -- a tunnel or a
+    reverse proxy reaches loopback just as well. ``cembedding.auth`` is the
+    layer that decides, and it says so in its own words.
+
+    Read at call time rather than at import, so the environment a process is
+    started with is the environment that takes effect.
+    """
+    source = os.environ if env is None else env
+    return source.get(HTTP_HOST_ENV, "").strip() or "127.0.0.1"
+
+
 EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
 EMBEDDING_API_URL = os.environ.get("EMBEDDING_API_URL", "https://api.openai.com/v1/embeddings")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "")  # provider-dependent default
@@ -1698,10 +1721,17 @@ async def handle_purge(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Purge failed: {e}"}, status=500)
 
 
-async def run_http_server(port: int) -> None:
-    """Run the HTTP embedding endpoint alongside MCP stdio."""
+async def run_http_server(port: int, host: str | None = None) -> None:
+    """Run the HTTP embedding endpoint alongside MCP stdio.
+
+    ``host`` defaults to :func:`resolve_http_host`. Every line below reports
+    the address actually passed to the socket rather than a literal, so a log
+    line cannot say loopback while the process listens somewhere else.
+    """
+    if host is None:
+        host = resolve_http_host()
     auth_token = resolve_auth_token()
-    check_startup("REST endpoint", f"127.0.0.1:{port}", auth_token)
+    check_startup("REST endpoint", f"{host}:{port}", auth_token)
 
     middlewares = [aiohttp_bearer_middleware(auth_token)] if auth_token else []
     app = web.Application(middlewares=middlewares)
@@ -1714,9 +1744,9 @@ async def run_http_server(port: int) -> None:
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
+    site = web.TCPSite(runner, host, port)
     await site.start()
-    logger.info("HTTP embedding endpoint started on http://127.0.0.1:%d/embed", port)
+    logger.info("HTTP embedding endpoint started on http://%s:%d/embed", host, port)
 
     try:
         # Block until cancelled
