@@ -24,3 +24,138 @@ jobs:
           ruff format --check cembedding/ tests/ scripts/
       - name: Test
         run: pytest -q
+
+  container:
+    # The image is built and run here rather than linted. A Dockerfile that no
+    # gate executes is a file that agrees with itself: the sibling memory server
+    # shipped one for five months whose EXPOSE named a port the process never
+    # bound, and nothing said so because nothing ever started it.
+    #
+    # Every check below is offline once the image is built. The providers that
+    # need weights download them from a model hub on first use, so a gate that
+    # exercised one would go red for reasons that have nothing to do with the
+    # commit; api_openai needs no weights and no reachable API to start, which
+    # is what these questions are about.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: cembedding:ci
+      COMMON: -e EMBEDDING_PROVIDER=api_openai -e EMBEDDING_API_KEY=unused -e EMBEDDING_INDEX_ENABLED=false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t "$IMAGE" .
+
+      - name: The build context carries only the wheel's inputs
+        # .dockerignore is an allowlist, and an allowlist that stops matching
+        # fails by admitting more rather than by erroring: this repository holds
+        # a `data/` directory that a model download fills with a gigabyte of
+        # weights, and a `.venv` beside it.
+        #
+        # Reading the built image cannot see that. Every COPY above names its
+        # source, so the image stays clean whatever the context holds -- deleting
+        # .dockerignore entirely leaves an image-side check green, which was
+        # measured before this step was written this way. The allowlist decides
+        # the context, so the context is what is read here, by building a
+        # throwaway image that copies all of it.
+        #
+        # The comparison is exact rather than a search for known-bad names:
+        # admitting one more path should have to be a deliberate edit here, and
+        # a list of things to look for only ever finds what someone thought of.
+        run: |
+          set -uo pipefail
+          printf 'FROM busybox\nCOPY . /ctx\n' > "$RUNNER_TEMP/context.Dockerfile"
+          docker build -q -f "$RUNNER_TEMP/context.Dockerfile" -t cembedding-context:ci .
+          admitted=$(docker run --rm cembedding-context:ci sh -c 'ls -A /ctx' | LC_ALL=C sort | tr '\n' ' ')
+          expected="LICENSE README.md cembedding pyproject.toml "
+          echo "context admits: $admitted"
+          if [ "$admitted" != "$expected" ]; then
+            echo "::error::the build context is [$admitted], expected [$expected] — .dockerignore admitted more (or the wheel's inputs changed and this line did not)"
+            exit 1
+          fi
+
+      - name: A published port reaches the endpoint
+        # The question a user asks first, and the one the image exists to answer
+        # yes to: the server's own default binds the container's loopback, where
+        # a published port forwards to a socket nothing is listening on.
+        # 405 is the wanted answer -- /embed is POST-only, so a GET that is
+        # answered at all proves the socket is bound and the app is behind it.
+        #
+        # The status is captured with `) || code=000` rather than `|| echo 000`
+        # inside the substitution: a curl that cannot connect prints its own
+        # "000" first, so the appended one makes "000000" -- a value no server
+        # returns, which is not equal to "000" either, so the wait loop exits on
+        # the first attempt and the step fails while the container is merely
+        # still starting.
+        run: |
+          set -uo pipefail
+          docker run -d --name reachable -p 18401:8401 $COMMON "$IMAGE"
+          code=000
+          for _ in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:18401/embed) || code=000
+            [ "$code" != "000" ] && break
+            sleep 0.5
+          done
+          docker logs reachable
+          docker rm -f reachable >/dev/null
+          if [ "$code" != "405" ]; then
+            echo "::error::GET /embed through the published port answered $code, expected 405"
+            exit 1
+          fi
+
+      - name: Forcing the address back to loopback makes it unreachable
+        # The control for the check above. Without it, a published port that
+        # answers proves nothing about the bind: it would answer just as well if
+        # some other change had made the port reachable. Same image, one
+        # variable moved, opposite outcome.
+        run: |
+          set -uo pipefail
+          docker run -d --name loopback -p 18402:8401 -e EMBEDDING_HTTP_HOST=127.0.0.1 $COMMON "$IMAGE"
+          sleep 8
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:18402/embed) || code=000
+          running=$(docker inspect -f '{{.State.Running}}' loopback)
+          docker rm -f loopback >/dev/null
+          if [ "$code" != "000" ]; then
+            echo "::error::the loopback-bound container answered $code through a published port"
+            exit 1
+          fi
+          if [ "$running" != "true" ]; then
+            echo "::error::the loopback-bound container is not running, so the refusal above proves nothing about the bind"
+            exit 1
+          fi
+
+      - name: It survives a run with no interactive stdin
+        # Under the stdio transport the process shuts down on stdin EOF, which a
+        # container without -i delivers at once. The failure is silent -- the
+        # endpoint logs that it started and the container exits 0 -- so this
+        # asks the only question that separates the two: is it still running.
+        run: |
+          set -uo pipefail
+          docker run -d --name survives $COMMON "$IMAGE"
+          sleep 10
+          running=$(docker inspect -f '{{.State.Running}}' survives)
+          code=$(docker inspect -f '{{.State.ExitCode}}' survives)
+          docker logs survives
+          docker rm -f survives >/dev/null
+          if [ "$running" != "true" ]; then
+            echo "::error::the container exited (status $code) without an interactive stdin"
+            exit 1
+          fi
+
+      - name: A configured token is enforced on the published port
+        run: |
+          set -uo pipefail
+          docker run -d --name guarded -p 18403:8401 -e CEMBEDDING_AUTH_TOKEN=probe-token $COMMON "$IMAGE"
+          code=000
+          for _ in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 -X POST http://127.0.0.1:18403/embed \
+              -H 'content-type: application/json' -d '{"texts":["x"]}') || code=000
+            [ "$code" != "000" ] && break
+            sleep 0.5
+          done
+          docker rm -f guarded >/dev/null
+          if [ "$code" != "401" ]; then
+            echo "::error::an anonymous POST /embed answered $code with a token configured, expected 401"
+            exit 1
+          fi

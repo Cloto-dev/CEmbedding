@@ -67,6 +67,40 @@ curl -s http://127.0.0.1:8401/embed \
   -d '{"texts":["hello world"]}' | head -c 200
 ```
 
+## Run it in a container
+
+No image is published: build it from this repository, at the revision you mean to run.
+
+```bash
+docker build -t cembedding .
+
+# Fill the volume once. Left to itself the server downloads the weights on the
+# first request instead -- with the port already accepting connections it cannot
+# yet answer, and no progress visible to whoever is waiting on it.
+docker run --rm -v cembedding-data:/data cembedding \
+    cembedding-download-model --model jina-v5-nano
+
+docker run -d --name cembedding -p 8401:8401 -v cembedding-data:/data \
+    -e EMBEDDING_PROVIDER=onnx_jina_v5_nano \
+    -e CEMBEDDING_AUTH_TOKEN="$(openssl rand -hex 32)" \
+    cembedding
+```
+
+The image sets `EMBEDDING_HTTP_HOST=0.0.0.0`, because inside a container the
+server's default binds the container's own loopback: a published port then
+forwards to a socket nothing is listening on, and the connection is refused in a
+way that reads like a crash. That is a reachability decision and not a security
+one — see [Authentication](#authentication-v062), and set a token whenever the
+port is published.
+
+`ONNX_MODEL_DIR` is `/data/model` in the image, so the download command above and
+the server look in the same place. One model per volume: the variable names a
+directory, not a collection.
+
+The model and the index live on the `/data` volume, which is what survives the
+container. A bind-mounted host directory has to be writable by uid 10001 (the
+image's user), or the run needs `--user "$(id -u)"`.
+
 ## Providers
 
 Set `EMBEDDING_PROVIDER`:
@@ -104,6 +138,7 @@ Vectors already indexed with one precision stay usable with another (the mixed-p
 |---------|---------|-------------|
 | `EMBEDDING_PROVIDER` | `api_openai` | Provider (see table above) |
 | `EMBEDDING_HTTP_PORT` | `8401` | HTTP port for `/embed` |
+| `EMBEDDING_HTTP_HOST` | `127.0.0.1` | Address `/embed` binds to. Loopback is right for a single host; a container has to bind an address its peers can reach (see [Run it in a container](#run-it-in-a-container)). Moving it decides nothing about who may call — a token does |
 | `EMBEDDING_INDEX_ENABLED` | `true` | Enable the persistent vector index endpoints (`/index`, `/search`, `/remove`, `/purge`) |
 | `EMBEDDING_INDEX_DB_PATH` | `data/embedding_index.db` | SQLite file backing the vector index |
 | `EMBEDDING_SEARCH_BACKEND` | `numpy` | `/search` matmul backend. `numpy` (Accelerate BLAS) or `mlx` (Apple-GPU resident matrix; falls back to numpy when mlx is absent) |

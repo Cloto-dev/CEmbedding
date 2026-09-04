@@ -1,0 +1,23 @@
+# What the build stage is allowed to read.
+#
+# An allowlist, not a list of exclusions. A denylist fails silently in the
+# expensive direction: a directory added to the repository later is copied into
+# the build context by default, and nobody notices until the image is large or
+# something private is inside it. This repository has a `data/` directory that a
+# developer's model download fills with a gigabyte of weights, and a `.venv`
+# beside it -- neither is an input to the wheel.
+#
+# The admitted set is exactly what building the wheel reads: the package and the
+# three files hatchling opens (metadata, readme, licence).
+*
+
+!cembedding/
+!pyproject.toml
+!README.md
+!LICENSE
+
+# Re-excluded after the directory above is admitted: compiled artifacts from a
+# host interpreter are not inputs, and a stale one can shadow the source it was
+# compiled from.
+**/__pycache__/
+**/*.pyc
