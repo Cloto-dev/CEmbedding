@@ -101,7 +101,9 @@ background boot.
 This skill only loads when a conversation activates it, but the operating
 policy below matters in **every** session that touches embeddings, so offer
 to persist it per the
-[CLAUDE.md Policy Generation Standard](https://github.com/Cloto-dev/CPersona/blob/master/docs/CLAUDE_MD_POLICY_STANDARD.md):
+[Always-Loaded Policy Block Standard](https://github.com/Cloto-dev/CPersona/blob/master/docs/CLAUDE_MD_POLICY_STANDARD.md)
+(v1.1: the target is whichever file the client loads every session — `CLAUDE.md`
+here, `AGENTS.md` on Codex and Cursor):
 
 - **Ask first** — show the exact block, get approval before writing.
 - **Default target: `~/.claude/CLAUDE.md`** (embeddings are cross-project
