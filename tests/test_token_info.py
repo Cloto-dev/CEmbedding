@@ -111,6 +111,16 @@ def test_offsets_are_characters_not_bytes():
     assert whole["window_end_char"] == len(text)
 
 
+def test_a_counter_built_from_a_file_does_not_load_it_until_asked(monkeypatch, tmp_path):
+    loads = []
+    monkeypatch.setattr(Tokenizer, "from_file", staticmethod(lambda p: loads.append(p) or _toy_tokenizer()))
+    counter = _TokenCounter.from_file(str(tmp_path / "tokenizer.json"), 5)
+    assert counter.window == 5 and loads == []
+    counter.count(["alpha"])
+    counter.count(["beta"])
+    assert len(loads) == 1
+
+
 # ---------------------------------------------------------------------- HTTP
 
 

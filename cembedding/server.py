@@ -13,6 +13,7 @@ import logging
 import os
 import platform as _platform
 import sys
+import threading
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Mapping
@@ -293,21 +294,30 @@ class _TokenCounter:
     The counter owns its own tokenizer, with truncation and padding off. The
     embedding tokenizer has both switched on, and toggling them per call would
     race with a model run on another thread. Counting needs no model run.
+
+    That second tokenizer costs about 29 MiB resident for jina-v5-nano, so a
+    counter built from a file loads it on first use: a server nobody asks
+    for token counts keeps the footprint it had before counting existed.
     """
 
-    def __init__(self, tokenizer, window: int):
+    def __init__(self, tokenizer, window: int, tokenizer_path: str | None = None):
         self._tokenizer = tokenizer
+        self._tokenizer_path = tokenizer_path
         self._window = window
-        # Truncation reserves room for the special tokens the post-processor adds
-        # (measured on jina-v5-nano: one), so only ``window - specials`` content
-        # tokens are embedded.
-        self._content_window = max(window - tokenizer.num_special_tokens_to_add(False), 0)
+        self._load_lock = threading.Lock()
 
     @classmethod
     def from_file(cls, tokenizer_path: str, window: int) -> "_TokenCounter":
-        from tokenizers import Tokenizer
+        return cls(None, window, tokenizer_path)
 
-        return cls(Tokenizer.from_file(tokenizer_path), window)
+    def _loaded(self):
+        if self._tokenizer is None:
+            with self._load_lock:
+                if self._tokenizer is None:
+                    from tokenizers import Tokenizer
+
+                    self._tokenizer = Tokenizer.from_file(self._tokenizer_path)
+        return self._tokenizer
 
     @property
     def window(self) -> int:
@@ -320,13 +330,18 @@ class _TokenCounter:
         is the character offset where the embedded prefix ends: ``text[:end]`` is
         what the vector represents, and it is ``len(text)`` when nothing was cut.
         """
+        tokenizer = self._loaded()
+        # Truncation reserves room for the special tokens the post-processor adds
+        # (measured on jina-v5-nano: one), so only ``window - specials`` content
+        # tokens are embedded.
+        content_window = max(self._window - tokenizer.num_special_tokens_to_add(False), 0)
         out = []
-        for text, encoding in zip(texts, self._tokenizer.encode_batch(texts)):
+        for text, encoding in zip(texts, tokenizer.encode_batch(texts)):
             total = len(encoding.ids)
             truncated = total > self._window
             if truncated:
                 content = [i for i, special in enumerate(encoding.special_tokens_mask) if not special]
-                kept = content[: self._content_window]
+                kept = content[:content_window]
                 end = encoding.offsets[kept[-1]][1] if kept else 0
             else:
                 end = len(text)
