@@ -280,6 +280,60 @@ class _BatchRunner:
 # ============================================================
 
 
+class _TokenCounter:
+    """Counts a text's tokens against the window the embedding path truncates to.
+
+    A caller that stores long records needs to know where the embedding stops
+    seeing them: text past the window is kept but is invisible to vector search.
+    That position is a fact of the deployment (the model and ``ONNX_MAX_SEQ_LEN``),
+    not of the caller, so the server reports it rather than letting every client
+    guess it from a character count — which, for the same token window, varies
+    by more than a factor of two between texts.
+
+    The counter owns its own tokenizer, with truncation and padding off. The
+    embedding tokenizer has both switched on, and toggling them per call would
+    race with a model run on another thread. Counting needs no model run.
+    """
+
+    def __init__(self, tokenizer, window: int):
+        self._tokenizer = tokenizer
+        self._window = window
+        # Truncation reserves room for the special tokens the post-processor adds
+        # (measured on jina-v5-nano: one), so only ``window - specials`` content
+        # tokens are embedded.
+        self._content_window = max(window - tokenizer.num_special_tokens_to_add(False), 0)
+
+    @classmethod
+    def from_file(cls, tokenizer_path: str, window: int) -> "_TokenCounter":
+        from tokenizers import Tokenizer
+
+        return cls(Tokenizer.from_file(tokenizer_path), window)
+
+    @property
+    def window(self) -> int:
+        return self._window
+
+    def count(self, texts: list[str]) -> list[dict]:
+        """One entry per text: ``count``, ``window``, ``truncated``, ``window_end_char``.
+
+        ``count`` includes special tokens, as the window does. ``window_end_char``
+        is the character offset where the embedded prefix ends: ``text[:end]`` is
+        what the vector represents, and it is ``len(text)`` when nothing was cut.
+        """
+        out = []
+        for text, encoding in zip(texts, self._tokenizer.encode_batch(texts)):
+            total = len(encoding.ids)
+            truncated = total > self._window
+            if truncated:
+                content = [i for i, special in enumerate(encoding.special_tokens_mask) if not special]
+                kept = content[: self._content_window]
+                end = encoding.offsets[kept[-1]][1] if kept else 0
+            else:
+                end = len(text)
+            out.append({"count": total, "window": self._window, "truncated": truncated, "window_end_char": end})
+        return out
+
+
 class EmbeddingProvider(ABC):
     """Abstract base class for embedding providers."""
 
@@ -294,6 +348,15 @@ class EmbeddingProvider(ABC):
     @abstractmethod
     def dimensions(self) -> int:
         """Return the embedding dimensionality."""
+
+    def token_counter(self) -> "_TokenCounter | None":
+        """The counter for this provider's window, or None when it cannot see the tokens.
+
+        A remote API tokenizes on its own side, and a provider whose tokenizer is
+        not a ``tokenizers`` file does not report here yet; both answer None, which
+        callers must read as "unknown", never as "fits".
+        """
+        return getattr(self, "_counter", None)
 
     async def shutdown(self) -> None:
         """Clean up resources."""
@@ -423,6 +486,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
         # texts). Output is unchanged — pooling honors the attention mask.
         self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
         self._tokenizer.enable_truncation(max_length=miniml_seq_len)
+        self._counter = _TokenCounter.from_file(tokenizer_path, miniml_seq_len)
 
         logger.info(
             "ONNX MiniLM provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
@@ -669,6 +733,7 @@ class OnnxBgeM3Provider(EmbeddingProvider):
         # padding cost the full max_seq_len on every call; output unchanged.
         self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=bge_seq_len)
+        self._counter = _TokenCounter.from_file(tokenizer_path, bge_seq_len)
 
         logger.info(
             "ONNX BGE-M3 provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
@@ -772,6 +837,7 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         # padding cost the full max_seq_len on every call; output unchanged.
         self._tokenizer.enable_padding(pad_id=0, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=ONNX_MAX_SEQ_LEN)
+        self._counter = _TokenCounter.from_file(tokenizer_path, ONNX_MAX_SEQ_LEN)
 
         logger.info(
             "ONNX Jina-v5-nano provider initialized (dir=%s, variant=%s, seq_len=%d, requested=%s, active=%s)",
@@ -1608,17 +1674,57 @@ async def handle_embed(request: web.Request) -> web.Response:
     if len(texts) > 100:
         return web.json_response({"error": "Batch size exceeds limit (max 100)"}, status=400)
 
+    token_info = body.get("token_info", False)
+    if not isinstance(token_info, bool):
+        return web.json_response({"error": "'token_info' must be a boolean"}, status=400)
+
     try:
         embeddings = await _provider.embed(texts)
-        return web.json_response(
-            {
-                "embeddings": embeddings,
-                "dimensions": _provider.dimensions(),
-            }
-        )
+        response = {
+            "embeddings": embeddings,
+            "dimensions": _provider.dimensions(),
+        }
+        # Opt-in, so a caller that does not ask receives exactly the response
+        # it received before this field existed.
+        if token_info:
+            response["token_info"] = await _count_tokens(texts)
+        return web.json_response(response)
     except Exception as e:
         logger.exception("Embedding failed")
         return web.json_response({"error": f"Embedding failed: {e}"}, status=500)
+
+
+async def _count_tokens(texts: list[str]) -> list[dict] | None:
+    counter = _provider.token_counter()
+    if counter is None:
+        return None
+    return await asyncio.get_running_loop().run_in_executor(None, counter.count, texts)
+
+
+async def handle_count_tokens(request: web.Request) -> web.Response:
+    """POST /count_tokens — Report each text's tokens against the embedding window, without embedding it."""
+    if _provider is None:
+        return web.json_response({"error": "Provider not initialized"}, status=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    texts = body.get("texts")
+    if not isinstance(texts, list) or not texts or not all(isinstance(t, str) for t in texts):
+        return web.json_response(
+            {"error": "'texts' must be a non-empty array of strings"},
+            status=400,
+        )
+    if len(texts) > 100:
+        return web.json_response({"error": "Batch size exceeds limit (max 100)"}, status=400)
+
+    try:
+        return web.json_response({"token_info": await _count_tokens(texts)})
+    except Exception as e:
+        logger.exception("Token counting failed")
+        return web.json_response({"error": f"Token counting failed: {e}"}, status=500)
 
 
 async def handle_index(request: web.Request) -> web.Response:
@@ -1721,6 +1827,20 @@ async def handle_purge(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Purge failed: {e}"}, status=500)
 
 
+def build_http_app(auth_token: str | None) -> web.Application:
+    """The REST application: every route behind the same bearer middleware."""
+    middlewares = [aiohttp_bearer_middleware(auth_token)] if auth_token else []
+    app = web.Application(middlewares=middlewares)
+    app.router.add_post("/embed", handle_embed)
+    app.router.add_post("/count_tokens", handle_count_tokens)
+    if EMBEDDING_INDEX_ENABLED and _vector_index is not None:
+        app.router.add_post("/index", handle_index)
+        app.router.add_post("/search", handle_search)
+        app.router.add_post("/remove", handle_remove)
+        app.router.add_post("/purge", handle_purge)
+    return app
+
+
 async def run_http_server(port: int, host: str | None = None) -> None:
     """Run the HTTP embedding endpoint alongside MCP stdio.
 
@@ -1733,14 +1853,7 @@ async def run_http_server(port: int, host: str | None = None) -> None:
     auth_token = resolve_auth_token()
     check_startup("REST endpoint", f"{host}:{port}", auth_token)
 
-    middlewares = [aiohttp_bearer_middleware(auth_token)] if auth_token else []
-    app = web.Application(middlewares=middlewares)
-    app.router.add_post("/embed", handle_embed)
-    if EMBEDDING_INDEX_ENABLED and _vector_index is not None:
-        app.router.add_post("/index", handle_index)
-        app.router.add_post("/search", handle_search)
-        app.router.add_post("/remove", handle_remove)
-        app.router.add_post("/purge", handle_purge)
+    app = build_http_app(auth_token)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
