@@ -301,7 +301,7 @@ class _TokenCounter:
     """
 
     def __init__(self, tokenizer, window: int, tokenizer_path: str | None = None):
-        self._tokenizer = tokenizer
+        self._tokenizer = self._unpadded(tokenizer) if tokenizer is not None else None
         self._tokenizer_path = tokenizer_path
         self._window = window
         self._load_lock = threading.Lock()
@@ -316,8 +316,17 @@ class _TokenCounter:
                 if self._tokenizer is None:
                     from tokenizers import Tokenizer
 
-                    self._tokenizer = Tokenizer.from_file(self._tokenizer_path)
+                    self._tokenizer = self._unpadded(Tokenizer.from_file(self._tokenizer_path))
         return self._tokenizer
+
+    @staticmethod
+    def _unpadded(tokenizer):
+        # A tokenizer.json can carry its own padding (jina-v5-nano's pads a batch to
+        # its longest member), and a padded entry reports the batch's length as every
+        # text's count. Both are cleared on the file as loaded, not assumed absent.
+        tokenizer.no_padding()
+        tokenizer.no_truncation()
+        return tokenizer
 
     @property
     def window(self) -> int:

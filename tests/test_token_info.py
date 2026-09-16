@@ -82,6 +82,27 @@ def test_the_reported_prefix_is_the_prefix_the_embedding_path_keeps():
     assert _toy_tokenizer().encode(text[: info["window_end_char"]]).ids == kept.ids
 
 
+def test_a_batch_is_counted_text_by_text_even_when_the_file_pads_batches():
+    """A tokenizer.json may enable padding (jina-v5-nano's pads to the batch's longest)."""
+    padded = _toy_tokenizer()
+    padded.enable_padding(pad_id=0, pad_token="[UNK]")
+    padded.enable_truncation(max_length=3)
+    short, long_ = "alpha", " ".join(WORDS)
+    info = _TokenCounter(padded, window=6).count([short, long_])
+    assert [i["count"] for i in info] == [3, len(WORDS) + 2]
+    assert info[0] == {"count": 3, "window": 6, "truncated": False, "window_end_char": len(short)}
+
+
+@pytest.mark.skipif(not os.path.exists(JINA_TOKENIZER), reason="jina-v5-nano assets not downloaded")
+def test_the_real_file_counts_a_mixed_batch_per_text():
+    texts = ["short note", "The embedding window closes long before the record ends. " * 20]
+    counter = _TokenCounter.from_file(JINA_TOKENIZER, 64)
+    short, long_ = counter.count(texts)
+    assert short["truncated"] is False and short["window_end_char"] == len(texts[0])
+    assert short["count"] < long_["count"]
+    assert [short] == counter.count(texts[:1])
+
+
 @pytest.mark.skipif(not os.path.exists(JINA_TOKENIZER), reason="jina-v5-nano assets not downloaded")
 @pytest.mark.parametrize(
     "text",
