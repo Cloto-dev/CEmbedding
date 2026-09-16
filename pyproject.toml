@@ -39,7 +39,9 @@ dependencies = [
 onnx     = ["onnxruntime>=1.17.0", "tokenizers>=0.15.0"]
 onnx-gpu = ["onnxruntime-gpu>=1.17.0", "tokenizers>=0.15.0"]
 mlx      = ["mlx>=0.18.0", "mlx-embeddings>=0.1.0"]
-dev      = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ruff>=0.4.0"]
+# tokenizers is here so CI exercises the token report with a synthetic tokenizer;
+# the model weights are still absent there, and the parity tests that need them skip.
+dev      = ["pytest>=8.0.0", "pytest-asyncio>=0.23.0", "ruff>=0.4.0", "tokenizers>=0.15.0"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

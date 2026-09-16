@@ -11,6 +11,8 @@ and self-skip where the model was never downloaded, like the padding tests.
 """
 
 import os
+import sys
+import types
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
@@ -221,6 +223,8 @@ async def test_each_local_provider_counts_against_the_window_it_truncates_to(
     monkeypatch, tmp_path, cls, seq_len, expected_window
 ):
     """The counter's window and the embedding tokenizer's truncation must be one number."""
+    # initialize() checks that onnxruntime imports; CI installs only the dev extra.
+    monkeypatch.setitem(sys.modules, "onnxruntime", types.ModuleType("onnxruntime"))
     monkeypatch.setattr(server, "ONNX_MAX_SEQ_LEN", seq_len)
     session = type("Session", (), {"get_providers": lambda self: ["CPUExecutionProvider"]})()
     monkeypatch.setattr(server, "_create_ort_session", lambda *a, **k: session)
