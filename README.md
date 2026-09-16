@@ -30,6 +30,28 @@ Request:  { "texts": ["string", ...] }                 # non-empty array, max 10
 Response: { "embeddings": [[float, ...], ...], "dimensions": <int> }
 ```
 
+### Where the vector stops seeing a text
+
+A model embeds only the first `window` tokens of a text; the rest is stored by the
+caller but invisible to vector search. How many characters that is depends on the
+text — for one window it varies by more than a factor of two — so the server reports
+it instead of leaving each client to guess.
+
+```
+POST /embed          { "texts": [...], "token_info": true }   # adds "token_info" to the response above
+POST /count_tokens   { "texts": [...] }                       # the same report, without running the model
+Response entry:      { "count": <int>, "window": <int>, "truncated": <bool>, "window_end_char": <int> }
+```
+
+- `count` and `window` both include the tokenizer's special tokens.
+- `window_end_char` is a character offset: `text[:window_end_char]` is what the vector
+  represents, and it equals `len(text)` when nothing was cut.
+- `token_info` is `null` when the provider cannot see its own tokens (`api_openai`,
+  `mlx_bge_m3`). Read that as unknown, never as "fits".
+- Without `"token_info": true`, `/embed` answers exactly as it did before the field existed.
+- The counting tokenizer loads on the first request that needs it (about 29 MiB resident
+  for jina-v5-nano), so a server that is never asked pays nothing.
+
 Point any client (e.g. CPersona's `CPERSONA_EMBEDDING_URL` / generic `EMBEDDING_HTTP_URL`) at `http://127.0.0.1:8401/embed`.
 
 ## Quick Start (on-device ONNX)
@@ -183,7 +205,7 @@ cembedding-sidecar build  --db data/embedding_index.db   # write one now
 
 ## Authentication (v0.6.2)
 
-Both HTTP surfaces — the REST endpoints (`/embed`, `/index`, `/search`,
+Both HTTP surfaces — the REST endpoints (`/embed`, `/count_tokens`, `/index`, `/search`,
 `/remove`, `/purge`) and the Streamable HTTP MCP transport — accept an inbound
 bearer token:
 
