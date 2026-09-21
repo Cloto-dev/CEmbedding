@@ -9,6 +9,8 @@ Design: docs/CPERSONA_MEMORY_DESIGN.md Section 5
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import platform as _platform
@@ -330,6 +332,9 @@ class _TokenCounter:
 
     @property
     def window(self) -> int:
+        """Where the embedding path truncates — and so part of the backend's
+        identity: two deployments differing only here return different vectors
+        for any text long enough to reach it."""
         return self._window
 
     def count(self, texts: list[str]) -> list[dict]:
@@ -358,6 +363,126 @@ class _TokenCounter:
         return out
 
 
+# ============================================================
+# Backend identity
+# ============================================================
+
+#: The fields an identity must carry before a caller may compare two sets of
+#: stored vectors. Every one of them changes the numbers, so a set missing any
+#: is not reduced to a fingerprint: a server answering with the half it knew
+#: would compare equal to a server running something else.
+IDENTITY_FIELDS = ("provider", "model", "dimensions", "window", "pooling", "normalized")
+
+#: The files an identity must digest. A model whose graph carries its own
+#: weights has no third entry, so "weights" is reported when present and not
+#: required here.
+IDENTITY_DIGESTS = ("graph", "tokenizer")
+
+#: sha256 by (path, size, mtime), so a model replaced in place is re-read. Kept
+#: for the life of the process: the graph of a mid-size model is hundreds of
+#: megabytes and its digest is asked for on every caller's startup.
+_DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
+_DIGEST_LOCK = asyncio.Lock()
+
+
+def _digest_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def _file_digest(path: str) -> str | None:
+    """sha256 of one file, computed once and off the event loop.
+
+    None when the file cannot be read. That is a missing component, not an empty
+    one: :func:`backend_identity` turns it into a refusal to fingerprint.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+    cached = _DIGEST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    async with _DIGEST_LOCK:
+        # Re-read under the lock so two callers arriving together hash once.
+        cached = _DIGEST_CACHE.get(key)
+        if cached is not None:
+            return cached
+        try:
+            digest = await asyncio.get_running_loop().run_in_executor(None, _digest_file, path)
+        except OSError:
+            return None
+        _DIGEST_CACHE[key] = digest
+        return digest
+
+
+def _onnx_identity(provider: "EmbeddingProvider", model: str, *, pooling: str) -> dict:
+    """The identity the local ONNX providers share.
+
+    ``pooling`` is named here and performed in the provider's ``_embed_sync`` a
+    few lines away. The two are deliberately separate statements of one fact:
+    changing how token states are reduced without changing this string would
+    leave the fingerprint equal across vectors that are not, so a test pins each
+    provider's declared pooling and a change has to be made in both places.
+    """
+    counter = provider.token_counter()
+    identity = {
+        "model": model,
+        "dimensions": provider.dimensions(),
+        "pooling": pooling,
+        "normalized": True,
+    }
+    if counter is not None:
+        identity["window"] = counter.window
+    return identity
+
+
+def _fingerprint(fields: Mapping) -> str:
+    """One token standing for a whole identity, equal across processes.
+
+    Serialised with sorted keys so two servers that agree on the facts agree on
+    the string, and carrying a scheme number so a later change to what an
+    identity contains cannot be mistaken for the same value computed differently.
+    """
+    body = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "1:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+async def backend_identity(provider: "EmbeddingProvider") -> dict:
+    """What produced this server's vectors, and the token standing for it.
+
+    ``fingerprint`` is what a caller stores beside a vector to decide later
+    whether a new vector may be compared with it. It is present only when every
+    field and digest is present; otherwise it is null and ``incomplete`` names
+    what is missing. A caller that receives null keeps whatever it did before
+    this endpoint existed and must not read "unknown" as "unchanged" — a default
+    that happens to match is not evidence that the model did.
+    """
+    fields = {k: v for k, v in provider.identity().items() if v is not None}
+    fields["provider"] = EMBEDDING_PROVIDER
+
+    digests: dict[str, str] = {}
+    for label, path in sorted(provider.identity_files().items()):
+        digest = await _file_digest(path)
+        if digest is not None:
+            digests[label] = digest
+    if digests:
+        fields["digests"] = digests
+
+    incomplete = [f for f in IDENTITY_FIELDS if f not in fields]
+    incomplete += [f"digests.{label}" for label in IDENTITY_DIGESTS if label not in digests]
+
+    return {
+        "identity": fields,
+        "incomplete": incomplete,
+        "fingerprint": None if incomplete else _fingerprint(fields),
+    }
+
+
 class EmbeddingProvider(ABC):
     """Abstract base class for embedding providers."""
 
@@ -381,6 +506,34 @@ class EmbeddingProvider(ABC):
         callers must read as "unknown", never as "fits".
         """
         return getattr(self, "_counter", None)
+
+    def identity(self) -> dict:
+        """What this backend is, in the terms that decide whether two sets of
+        stored vectors may be compared.
+
+        Every field here changes the numbers: the graph, the tokenizer, the
+        width, the truncation point, and the way token states are reduced to one
+        vector. A provider reports only what it can establish from what it
+        actually loaded. A field it cannot establish is left out, and
+        :func:`backend_identity` then declines to fingerprint at all rather than
+        fingerprinting the half it knows — a partial identity that compares equal
+        is the failure this endpoint exists to prevent.
+        """
+        return {}
+
+    def identity_files(self) -> dict[str, str]:
+        """Label -> path for the files whose contents define this backend.
+
+        A provider names every file it loaded, not just the entry point. Weights
+        held in ONNX external-data format live beside the graph, so hashing the
+        ``.onnx`` alone would give one digest to two different sets of weights.
+
+        The paths come from ``_loaded_files``, which a provider fills at the
+        moment it opens them. Recomputing them here from configuration would
+        report the file the settings name rather than the file in the session,
+        and those differ after any download, fallback or clamp.
+        """
+        return dict(getattr(self, "_loaded_files", None) or {})
 
     async def shutdown(self) -> None:
         """Clean up resources."""
@@ -447,6 +600,16 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
     def dimensions(self) -> int:
         return self._dimensions
 
+    def identity(self) -> dict:
+        """The model name this process sends, and the width it last saw back.
+
+        No digest, no window and no pooling: the graph and the tokenizer are on
+        the other side of the network, and the name is what the operator asked
+        for rather than what answered. That gap is why this provider never
+        completes an identity — see :func:`backend_identity`.
+        """
+        return {"model": self._model, "dimensions": self._dimensions, "normalized": True}
+
     async def shutdown(self) -> None:
         if self._client:
             await self._client.aclose()
@@ -511,6 +674,7 @@ class OnnxMiniLMProvider(EmbeddingProvider):
         self._tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
         self._tokenizer.enable_truncation(max_length=miniml_seq_len)
         self._counter = _TokenCounter.from_file(tokenizer_path, miniml_seq_len)
+        self._loaded_files = {"graph": model_path, "tokenizer": tokenizer_path}
 
         logger.info(
             "ONNX MiniLM provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
@@ -558,6 +722,9 @@ class OnnxMiniLMProvider(EmbeddingProvider):
 
     def dimensions(self) -> int:
         return 384
+
+    def identity(self) -> dict:
+        return _onnx_identity(self, "all-MiniLM-L6-v2", pooling="mean")
 
     async def shutdown(self) -> None:
         self._session = None
@@ -701,6 +868,23 @@ class MlxBgeM3Provider(EmbeddingProvider):
     def dimensions(self) -> int:
         return 1024
 
+    def identity(self) -> dict:
+        """Everything but the files.
+
+        ``mlx_load`` takes a repository id as readily as a directory and resolves
+        it through a cache this process does not own, so there is no path here
+        that is certainly the one that was read. Reporting the configured string
+        as if it were a digest would be the mistake this endpoint exists to stop,
+        so the file half is simply absent and the identity stays incomplete.
+        """
+        return {
+            "model": self._model_path,
+            "dimensions": self.dimensions(),
+            "window": min(ONNX_MAX_SEQ_LEN, 8192),
+            "pooling": "model",
+            "normalized": True,
+        }
+
     async def shutdown(self) -> None:
         self._model = None
         self._tokenizer = None
@@ -758,6 +942,7 @@ class OnnxBgeM3Provider(EmbeddingProvider):
         self._tokenizer.enable_padding(pad_id=1, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=bge_seq_len)
         self._counter = _TokenCounter.from_file(tokenizer_path, bge_seq_len)
+        self._loaded_files = {"graph": model_path, "tokenizer": tokenizer_path}
 
         logger.info(
             "ONNX BGE-M3 provider initialized (dir=%s, seq_len=%d, requested=%s, active=%s)",
@@ -800,6 +985,9 @@ class OnnxBgeM3Provider(EmbeddingProvider):
 
     def dimensions(self) -> int:
         return 1024
+
+    def identity(self) -> dict:
+        return _onnx_identity(self, "bge-m3", pooling="cls")
 
     async def shutdown(self) -> None:
         self._session = None
@@ -862,6 +1050,13 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
         self._tokenizer.enable_padding(pad_id=0, pad_token="<pad>")
         self._tokenizer.enable_truncation(max_length=ONNX_MAX_SEQ_LEN)
         self._counter = _TokenCounter.from_file(tokenizer_path, ONNX_MAX_SEQ_LEN)
+        # The graph here is a stub that names its weights in a sibling file, so
+        # both are listed: two precisions of this model have nearly identical
+        # .onnx files and entirely different .onnx_data ones.
+        self._loaded_files = {"graph": model_path, "tokenizer": tokenizer_path}
+        external_data = f"{model_path}_data"
+        if os.path.exists(external_data):
+            self._loaded_files["weights"] = external_data
 
         logger.info(
             "ONNX Jina-v5-nano provider initialized (dir=%s, variant=%s, seq_len=%d, requested=%s, active=%s)",
@@ -911,6 +1106,9 @@ class OnnxJinaV5NanoProvider(EmbeddingProvider):
 
     def dimensions(self) -> int:
         return 768
+
+    def identity(self) -> dict:
+        return _onnx_identity(self, "jina-embeddings-v5-text-nano-retrieval", pooling="last_token")
 
     async def shutdown(self) -> None:
         self._session = None
@@ -1751,6 +1949,23 @@ async def handle_count_tokens(request: web.Request) -> web.Response:
         return web.json_response({"error": f"Token counting failed: {e}"}, status=500)
 
 
+async def handle_capabilities(request: web.Request) -> web.Response:
+    """GET /capabilities — what this backend is, and the fingerprint standing for it.
+
+    Its own route rather than a field on ``/embed``: the answer is the same for
+    every request and costs a digest of the model the first time, while /embed is
+    on the path of every write a caller makes.
+    """
+    if _provider is None:
+        return web.json_response({"error": "Provider not initialized"}, status=503)
+
+    try:
+        return web.json_response(await backend_identity(_provider))
+    except Exception as e:
+        logger.exception("Capability report failed")
+        return web.json_response({"error": f"Capability report failed: {e}"}, status=500)
+
+
 async def handle_index(request: web.Request) -> web.Response:
     """POST /index — Index vectors for later search."""
     if _provider is None or _vector_index is None:
@@ -1857,6 +2072,7 @@ def build_http_app(auth_token: str | None) -> web.Application:
     app = web.Application(middlewares=middlewares)
     app.router.add_post("/embed", handle_embed)
     app.router.add_post("/count_tokens", handle_count_tokens)
+    app.router.add_get("/capabilities", handle_capabilities)
     if EMBEDDING_INDEX_ENABLED and _vector_index is not None:
         app.router.add_post("/index", handle_index)
         app.router.add_post("/search", handle_search)

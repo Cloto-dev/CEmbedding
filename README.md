@@ -52,6 +52,36 @@ Response entry:      { "count": <int>, "window": <int>, "truncated": <bool>, "wi
 - The counting tokenizer loads on the first request that needs it (about 29 MiB resident
   for jina-v5-nano), so a server that is never asked pays nothing.
 
+### Which backend produced a vector
+
+A caller stores vectors and comes back later to ask whether a stored one may still be
+compared with a fresh one. Over `/embed` it cannot tell: it posts texts and the server
+picks the model, so a client that falls back to a configured default reads two different
+models as one. `/capabilities` answers what actually ran.
+
+```
+GET /capabilities
+Response: { "identity":    { "provider": ..., "model": ..., "dimensions": <int>,
+                             "window": <int>, "pooling": ..., "normalized": <bool>,
+                             "digests": { "graph": ..., "tokenizer": ..., "weights": ... } },
+            "incomplete":  [ ... ],
+            "fingerprint": "1:<hex>" | null }
+```
+
+- `fingerprint` is the one value to store beside a vector. Two vectors may be compared
+  when their fingerprints are equal.
+- It covers everything that moves the numbers: the graph and tokenizer contents, the
+  width, the truncation window, the pooling, and the provider. Two precisions of one
+  model fingerprint differently; a configured model name cannot tell them apart.
+- `incomplete` names the components this deployment could not establish, and `fingerprint`
+  is then `null` — never a shorter fingerprint over the part it knew. A remote API
+  (`api_openai`) and the MLX provider report at least their digests as missing, because
+  the files that would be hashed are not this process's to read.
+- **`null` means unknown, not unchanged.** A caller that receives it keeps whatever it
+  did before this endpoint existed; it must not read a matching default as a matching model.
+- The digest of a model graph is computed once per file state and cached, so the first
+  call after a restart pays for reading it and later calls do not.
+
 Point any client (e.g. CPersona's `CPERSONA_EMBEDDING_URL` / generic `EMBEDDING_HTTP_URL`) at `http://127.0.0.1:8401/embed`.
 
 ## Quick Start (on-device ONNX)
@@ -205,9 +235,9 @@ cembedding-sidecar build  --db data/embedding_index.db   # write one now
 
 ## Authentication (v0.6.2)
 
-Both HTTP surfaces — the REST endpoints (`/embed`, `/count_tokens`, `/index`, `/search`,
-`/remove`, `/purge`) and the Streamable HTTP MCP transport — accept an inbound
-bearer token:
+Both HTTP surfaces — the REST endpoints (`/embed`, `/count_tokens`, `/capabilities`,
+`/index`, `/search`, `/remove`, `/purge`) and the Streamable HTTP MCP transport — accept
+an inbound bearer token:
 
 ```bash
 CEMBEDDING_AUTH_TOKEN=$(openssl rand -hex 32)
