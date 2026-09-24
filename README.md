@@ -6,6 +6,7 @@
 
 Vector embeddings over a tiny HTTP contract.
 On-device ONNX or any OpenAI-compatible API. The reference `/embed` server for [CPersona](https://github.com/Cloto-dev/CPersona).
+Also available as the CEmbedding MCP embedding server (stdio and Streamable HTTP).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Cloto-dev/CEmbedding/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue.svg)]()
