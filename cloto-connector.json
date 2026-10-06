@@ -115,7 +115,7 @@
     {
       "name": "ONNX_ALLOW_SPINNING",
       "default": "0",
-      "description": "Whether ONNX Runtime's worker threads keep spinning on the CPU after a run, waiting for the next one. 1 restores the runtime's default. Off, the cores are free as soon as a request is answered: on a 4-core Intel host the spinning held 3 cores for about 1.4 s after each query, with no gain in speed."
+      "description": "Whether ONNX Runtime's worker threads keep spinning on the CPU after a run, waiting for the next one. 1 restores the runtime's default. Off, the cores are free as soon as a request is answered: on a 4-core Intel host the spinning held 3 cores for about 1.4 s after each query, and a recall that embedded its query and then searched took a median of 1.58 s against 1.94 s with it. Spinning makes embed calls made back to back faster (113-129 ms against 146-148 ms there), so set 1 for a server whose callers only embed."
     },
     {
       "name": "EMBEDDING_MAX_BATCH",

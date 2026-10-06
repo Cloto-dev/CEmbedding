@@ -115,10 +115,14 @@ if ONNX_GRAPH_OPT_LEVEL not in ("disable", "basic", "extended", "all"):
 # 4-core Linux host (onnxruntime 1.30, jina-v5-nano, CPU) one short query left
 # the 3 worker threads at 100% for about 1.4 s after the response: the moment a
 # caller on the same host, such as a memory server about to search, needs the
-# cores. Without spinning that time went to 0 and the model ran no slower: a
-# single query took 53 ms against 54 ms with spinning, 30 short queries in a row
-# 53 ms each against 55 ms, and 8 x 512-token batches 12.3 s either way. Off by
-# default; 1 restores the runtime's spinning.
+# cores. Measured there, a recall that embedded its query through this server
+# and then searched 100,000 memories took a median of 1.58 s without spinning
+# against 1.94 s with it. Spinning does buy something: embed calls made back to
+# back through the server took 146-148 ms each without it against 113-129 ms
+# with it (a bare session showed no such difference, 53 ms against 55 ms, and
+# 8 x 512-token batches took 12.3 s either way). Off by default, for the caller
+# that searches after it embeds; 1 restores the runtime's spinning, for a server
+# whose callers only embed.
 ONNX_ALLOW_SPINNING = os.environ.get("ONNX_ALLOW_SPINNING", "0").strip()
 if ONNX_ALLOW_SPINNING not in ("0", "1"):
     raise ValueError(f"ONNX_ALLOW_SPINNING must be 0 or 1, got {ONNX_ALLOW_SPINNING}")
