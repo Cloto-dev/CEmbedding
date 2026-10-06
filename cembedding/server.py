@@ -110,6 +110,23 @@ ONNX_GRAPH_OPT_LEVEL = os.environ.get("ONNX_GRAPH_OPT_LEVEL", "all").strip().low
 if ONNX_GRAPH_OPT_LEVEL not in ("disable", "basic", "extended", "all"):
     raise ValueError(f"ONNX_GRAPH_OPT_LEVEL must be disable, basic, extended or all, got {ONNX_GRAPH_OPT_LEVEL}")
 
+# Whether the runtime's worker threads keep spinning on the CPU after a model
+# run returns, waiting for the next one. ONNX Runtime spins by default. On a
+# 4-core Linux host (onnxruntime 1.30, jina-v5-nano, CPU) one short query left
+# the 3 worker threads at 100% for about 1.4 s after the response: the moment a
+# caller on the same host, such as a memory server about to search, needs the
+# cores. Measured there, a recall that embedded its query through this server
+# and then searched 100,000 memories took a median of 1.58 s without spinning
+# against 1.94 s with it. Spinning does buy something: embed calls made back to
+# back through the server took 146-148 ms each without it against 113-129 ms
+# with it (a bare session showed no such difference, 53 ms against 55 ms, and
+# 8 x 512-token batches took 12.3 s either way). Off by default, for the caller
+# that searches after it embeds; 1 restores the runtime's spinning, for a server
+# whose callers only embed.
+ONNX_ALLOW_SPINNING = os.environ.get("ONNX_ALLOW_SPINNING", "0").strip()
+if ONNX_ALLOW_SPINNING not in ("0", "1"):
+    raise ValueError(f"ONNX_ALLOW_SPINNING must be 0 or 1, got {ONNX_ALLOW_SPINNING}")
+
 # Largest merged run the local providers may build out of concurrent requests.
 # A local model holds one session that runs one forward pass at a time, and a
 # batched pass costs far less per text than the same texts one pass at a time
@@ -766,6 +783,7 @@ def _ort_session_options():
     options = ort.SessionOptions()
     if ONNX_INTRA_OP_THREADS:
         options.intra_op_num_threads = ONNX_INTRA_OP_THREADS
+    options.add_session_config_entry("session.intra_op.allow_spinning", ONNX_ALLOW_SPINNING)
     options.graph_optimization_level = {
         "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
         "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
