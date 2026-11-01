@@ -90,15 +90,17 @@ Point any client (e.g. CPersona's `CPERSONA_EMBEDDING_URL` / generic `EMBEDDING_
 **Prerequisites:** Python 3.10+
 
 ```bash
-# Download a model into ./data/models (jina-v5-nano is what CPersona is tuned for)
-uvx --from "cembedding[onnx]" cembedding-download-model --model jina-v5-nano
+# Download a model into ./data/models (bge-m3: MIT-licensed, multilingual)
+uvx --from "cembedding[onnx]" cembedding-download-model --model bge-m3
 
 # Run the server (reads ./data/models from the current directory)
-EMBEDDING_PROVIDER=onnx_jina_v5_nano uvx --from "cembedding[onnx]" cembedding
+EMBEDDING_PROVIDER=onnx_bge_m3 uvx --from "cembedding[onnx]" cembedding
 ```
 
 Or install it onto your PATH with `pip install "cembedding[onnx]"`, then run
-`cembedding-download-model --model jina-v5-nano` and `cembedding`.
+`cembedding-download-model --model bge-m3` and `EMBEDDING_PROVIDER=onnx_bge_m3 cembedding`.
+Name the provider every time: without it the server uses `api_openai`, not the model
+just downloaded.
 
 From source (development):
 
@@ -108,8 +110,8 @@ cd CEmbedding
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install ".[onnx]"
-python -m cembedding.download_model --model jina-v5-nano
-EMBEDDING_PROVIDER=onnx_jina_v5_nano python -m cembedding   # or: python server.py
+python -m cembedding.download_model --model bge-m3
+EMBEDDING_PROVIDER=onnx_bge_m3 python -m cembedding   # or: python server.py
 ```
 
 You should see `HTTP embedding endpoint started on http://127.0.0.1:8401/embed`. Verify it:
@@ -131,10 +133,10 @@ docker build -t cembedding .
 # first request instead -- with the port already accepting connections it cannot
 # yet answer, and no progress visible to whoever is waiting on it.
 docker run --rm -v cembedding-data:/data cembedding \
-    cembedding-download-model --model jina-v5-nano
+    cembedding-download-model --model bge-m3
 
 docker run -d --name cembedding -p 8401:8401 -v cembedding-data:/data \
-    -e EMBEDDING_PROVIDER=onnx_jina_v5_nano \
+    -e EMBEDDING_PROVIDER=onnx_bge_m3 \
     -e CEMBEDDING_AUTH_TOKEN="$(openssl rand -hex 32)" \
     cembedding
 ```
@@ -160,14 +162,14 @@ Set `EMBEDDING_PROVIDER`:
 
 | Value | Model | Notes |
 |-------|-------|-------|
-| `onnx_jina_v5_nano` | jina-embeddings-v5-text-nano-retrieval (~212M params in the fp32 ONNX graph, 768d) | Local CPU, what CPersona is benchmarked against |
-| `onnx_bge_m3` | bge-m3 | Local CPU, larger / multilingual |
-| `onnx_miniml` | all-MiniLM-L6-v2 (22M, 384d) | Local CPU, smallest |
+| `onnx_bge_m3` | bge-m3, int8 ONNX ([Xenova/bge-m3](https://huggingface.co/Xenova/bge-m3), ~550 MB, 1024d) | Local CPU, multilingual, MIT. Recommended |
+| `onnx_jina_v5_nano` | jina-embeddings-v5-text-nano-retrieval (~212M params in the fp32 ONNX graph, 768d) | Local CPU. Licensed [CC BY-NC 4.0](https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval): non-commercial use only |
+| `onnx_miniml` | all-MiniLM-L6-v2 (22M, 384d) | Local CPU, smallest, English only, Apache 2.0 |
 | `mlx_bge_m3` | bge-m3 (MLX) | Apple Silicon only — `pip install ".[mlx]"` |
-| `auto_bge_m3` | bge-m3 | Auto-selects MLX on Apple Silicon, ONNX elsewhere |
+| `auto_bge_m3` | bge-m3 | Auto-selects MLX on Apple Silicon, ONNX elsewhere. MLX runs fp16, so its vectors differ from `onnx_bge_m3`'s: keep one store on one of the two |
 | `api_openai` | provider's model | OpenAI-compatible API; needs `EMBEDDING_API_KEY` (+ optional `EMBEDDING_API_URL`, `EMBEDDING_MODEL`) |
 
-Download a local model with `cembedding-download-model --model {miniml,jina-v5-nano,bge-m3}` (or `python -m cembedding.download_model ...` from a source checkout; fetched from HuggingFace into `./data/models`, not committed to this repo).
+Download a local model with `cembedding-download-model --model {bge-m3,jina-v5-nano,miniml}` (bge-m3 when `--model` is left out) (or `python -m cembedding.download_model ...` from a source checkout; fetched from HuggingFace into `./data/models`, not committed to this repo).
 
 ## Model precision
 

@@ -20,7 +20,7 @@
 # once, before anything depends on the service:
 #
 #   docker run --rm -v cembedding-data:/data <image> \
-#       cembedding-download-model --model jina-v5-nano
+#       cembedding-download-model --model bge-m3
 #
 # ONNX_MODEL_DIR below points both that command and the server at the same
 # directory, so the model a run downloads is the model the next run loads. One

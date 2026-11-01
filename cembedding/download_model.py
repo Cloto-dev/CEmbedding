@@ -135,7 +135,13 @@ def download_bge_m3(model_dir: str = "") -> bool:
 def main():
     """Console-script / ``python -m cembedding.download_model`` entry point."""
     parser = argparse.ArgumentParser(description="Download ONNX embedding models")
-    parser.add_argument("--model", default="miniml", choices=["miniml", "jina-v5-nano", "bge-m3"])
+    parser.add_argument(
+        "--model",
+        default="bge-m3",
+        choices=["miniml", "jina-v5-nano", "bge-m3"],
+        help="model to fetch (default: bge-m3, MIT-licensed; jina-v5-nano is licensed CC BY-NC 4.0, "
+        "non-commercial use only)",
+    )
     parser.add_argument(
         "--variant",
         default="fp32",
